@@ -232,7 +232,7 @@ process.on("uncaughtException", (err) => {
 });
 
 client.once(Events.ClientReady, async () => {
-  cconsole.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
+  console.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
 console.log("[AUTO] AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
 console.log("[AUTO] AUTO_SYNC_WEEKS_BACK =", process.env.AUTO_SYNC_WEEKS_BACK);
 console.log("[AUTO] AUTO_SYNC_ON_START =", process.env.AUTO_SYNC_ON_START);
