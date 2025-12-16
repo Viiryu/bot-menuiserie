@@ -3,7 +3,6 @@ require("dotenv").config();
 const express = require("express");
 const app = express();
 
-app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/healthz", (req, res) => res.status(200).send("healthy"));
 
 const PORT = Number(process.env.PORT || 3000);
