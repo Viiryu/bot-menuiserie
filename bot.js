@@ -238,6 +238,18 @@ console.log("[AUTO] AUTO_SYNC_WEEKS_BACK =", process.env.AUTO_SYNC_WEEKS_BACK);
 console.log("[AUTO] AUTO_SYNC_ON_START =", process.env.AUTO_SYNC_ON_START);
   console.log(`✅ Bot prêt : ${client.user.tag}`);
   logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`, {});
+  // ===== AUTO-SYNC SCHEDULER =====
+if (AUTO_SYNC) {
+  logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
+
+  if (AUTO_SYNC_ON_START) {
+    runAutoSyncOnce().catch(() => {});
+  }
+
+  setInterval(() => {
+    runAutoSyncOnce().catch(() => {});
+  }, AUTO_SYNC_INTERVAL_SECONDS * 1000);
+}
 });
 
 // ===================== UTILS =====================
