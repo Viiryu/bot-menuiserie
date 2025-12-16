@@ -232,6 +232,8 @@ process.on("uncaughtException", (err) => {
 });
 
 client.once(Events.ClientReady, () => {
+  console.log("AUTO_SYNC =", process.env.AUTO_SYNC);
+console.log("AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
   console.log(`✅ Bot prêt : ${client.user.tag}`);
   logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`, {});
 });
