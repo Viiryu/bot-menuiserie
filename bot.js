@@ -1,265 +1,91 @@
+/* bot.js — LGW Menuiserie Bot (4 historiques + autosync + hosting)
+ * Node: CommonJS
+ * Dépendances: discord.js, dotenv, googleapis, express
+ */
+
 require("dotenv").config();
 
-const express = require("express");
-const app = express();
-
-app.get("/healthz", (req, res) => res.status(200).send("healthy"));
-
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => console.log(`🌐 HTTP listening on ${PORT}`));
-
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
+const express = require("express");
 const { google } = require("googleapis");
 const {
   Client,
   GatewayIntentBits,
-  Events,
   Partials,
+  Events,
   EmbedBuilder,
 } = require("discord.js");
+
+// ===================== HOSTING (Koyeb) =====================
+const app = express();
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/healthz", (req, res) => res.status(200).send("healthy"));
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, () => console.log(`🌐 HTTP listening on ${PORT}`));
 
 // ===================== ENV =====================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const GOOGLE_KEYFILE = process.env.GOOGLE_KEYFILE;
 
+// Channels
+const LOGS_CHANNEL_ID = process.env.LOGS_CHANNEL_ID || "";
 const SALAIRES_CHANNEL_ID = process.env.SALAIRES_CHANNEL_ID || "";
 const COMMANDES_CHANNEL_ID = process.env.COMMANDES_CHANNEL_ID || "";
 const RACHAT_EMPLOYE_CHANNEL_ID = process.env.RACHAT_EMPLOYE_CHANNEL_ID || "";
 const RACHAT_TEMPORAIRE_CHANNEL_ID = process.env.RACHAT_TEMPORAIRE_CHANNEL_ID || "";
 
-const LOGS_CHANNEL_ID = process.env.LOGS_CHANNEL_ID || "";
-const LOGS_TO_SHEETS = String(process.env.LOGS_TO_SHEETS || "false").toLowerCase() === "true";
-const LOGS_SHEET = process.env.LOGS_SHEET || "Logs";
-const LOGS_LEVEL = String(process.env.LOGS_LEVEL || "info").toLowerCase(); // info | debug
+// Google key file
+const GOOGLE_KEYFILE = process.env.GOOGLE_KEYFILE || "service-account.json";
+// Optionnel: si tu veux passer le JSON en base64 en env
+const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
+// Permissions (2 rôles autorisés, IDs séparés par virgule)
 const PAY_ROLE_IDS = (process.env.PAY_ROLE_IDS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!DISCORD_TOKEN || !SPREADSHEET_ID || !GOOGLE_KEYFILE) {
-  console.error("❌ .env incomplet: DISCORD_TOKEN / SPREADSHEET_ID / GOOGLE_KEYFILE requis.");
+// Auto-sync
+const AUTO_SYNC = String(process.env.AUTO_SYNC || "false").toLowerCase() === "true";
+const AUTO_SYNC_INTERVAL_SECONDS = Number(process.env.AUTO_SYNC_INTERVAL_SECONDS || 120);
+const AUTO_SYNC_WEEKS_BACK = Number(process.env.AUTO_SYNC_WEEKS_BACK || 2);
+const AUTO_SYNC_ON_START = String(process.env.AUTO_SYNC_ON_START || "true").toLowerCase() === "true";
+
+if (!DISCORD_TOKEN) {
+  console.error("❌ DISCORD_TOKEN manquant (env).");
+  process.exit(1);
+}
+if (!SPREADSHEET_ID) {
+  console.error("❌ SPREADSHEET_ID manquant (env).");
   process.exit(1);
 }
 
-if (PAY_ROLE_IDS.length === 0) {
-  console.warn("⚠️ PAY_ROLE_IDS est vide : toutes les commandes admin seront refusées.");
-}
+// ===================== SHEETS (NOMS ONGLET) =====================
+const SHEET_SALAIRES = "Historique salaires";
+const SHEET_COMMANDES = "Historique commandes";
+const SHEET_RACHAT_EMPLOYE = "Historique rachat employé";
+const SHEET_RACHAT_TEMP = "Historique rachat temporaire";
 
-// ===================== SHEETS NAMES =====================
-const LINKS_SHEET = "BOT_LINKS";
+const SHEET_BOT_STATE_SALAIRES = "BOT_STATE"; // salaires (lock semaine)
+const SHEET_BOT_STATE_COMMANDES = "BOT_STATE_COMMANDES";
+const SHEET_BOT_STATE_RACHAT_EMPLOYE = "BOT_STATE_RACHAT_EMPLOYE";
+const SHEET_BOT_STATE_RACHAT_TEMP = "BOT_STATE_RACHAT_TEMP";
 
-// historiques
-const SALAIRES_SHEET = "Historique salaires";
-const COMMANDES_SHEET = "Historique commandes";
-const RACHAT_EMPLOYE_SHEET = "Historique rachat employé";
-const RACHAT_TEMPORAIRE_SHEET = "Historique rachat temporaire";
-
-// states
-const BOT_STATE_SALAIRES = "BOT_STATE"; // déjà utilisé (lock + message ids salaires)
-const BOT_STATE_COMMANDES = "BOT_STATE_COMMANDES";
-const BOT_STATE_RACHAT_EMPLOYE = "BOT_STATE_RACHAT_EMPLOYE";
-const BOT_STATE_RACHAT_TEMPORAIRE = "BOT_STATE_RACHAT_TEMPORAIRE";
-
-// ===================== DISCORD CLIENT =====================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.DirectMessages,
-  ],
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
-});
-
-// ===================== LOGGER =====================
-const logQueue = [];
-let logFlushRunning = false;
-
-function shouldLog(level) {
-  const order = { debug: 0, info: 1, warn: 2, error: 3 };
-  const cur = order[LOGS_LEVEL] ?? 1;
-  const lvl = order[level] ?? 1;
-  return lvl >= cur;
-}
-
-async function ensureLogsSheet(sheets) {
-  if (!LOGS_TO_SHEETS) return;
-
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const titles = (meta.data.sheets || []).map((s) => s.properties?.title);
-  if (titles.includes(LOGS_SHEET)) return;
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: { requests: [{ addSheet: { properties: { title: LOGS_SHEET } } }] },
-  });
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LOGS_SHEET}!A1:K1`,
-    valueInputOption: "RAW",
-    requestBody: {
-      values: [[
-        "timestamp",
-        "level",
-        "source",
-        "action",
-        "week",
-        "actorTag",
-        "actorId",
-        "guildId",
-        "channelId",
-        "target",
-        "details"
-      ]],
-    },
-  });
-}
-
-async function appendLogRowToSheets(sheets, payload) {
-  if (!LOGS_TO_SHEETS) return;
-  await ensureLogsSheet(sheets);
-
-  const row = [
-    payload.timestamp,
-    payload.level,
-    payload.source,
-    payload.action,
-    payload.week || "",
-    payload.actorTag || "",
-    payload.actorId || "",
-    payload.guildId || "",
-    payload.channelId || "",
-    payload.target || "",
-    payload.details || "",
-  ];
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LOGS_SHEET}!A:K`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [row] },
-  });
-}
-
-async function sendLogToDiscord(payload) {
-  if (!LOGS_CHANNEL_ID) return;
-
-  const ch = await client.channels.fetch(LOGS_CHANNEL_ID).catch(() => null);
-  if (!ch || !ch.isTextBased?.()) return;
-
-  const { EmbedBuilder } = require("discord.js");
-
-  const embed = new EmbedBuilder()
-    .setTitle(`${payload.level.toUpperCase()} • ${payload.action}`)
-    .setDescription(payload.details ? String(payload.details).slice(0, 3500) : "—")
-    .setTimestamp(new Date(payload.timestamp));
-
-  const fields = [];
-  if (payload.source) fields.push({ name: "Source", value: payload.source, inline: true });
-  if (payload.week) fields.push({ name: "Semaine", value: payload.week, inline: true });
-  if (payload.actorTag) fields.push({ name: "Auteur", value: `${payload.actorTag} (${payload.actorId})`, inline: false });
-  if (payload.target) fields.push({ name: "Cible", value: String(payload.target).slice(0, 1024), inline: false });
-  if (payload.guildId) fields.push({ name: "Guild", value: payload.guildId, inline: true });
-  if (payload.channelId) fields.push({ name: "Channel", value: payload.channelId, inline: true });
-
-  if (fields.length) embed.addFields(fields.slice(0, 25));
-
-  await ch.send({ embeds: [embed] }).catch(() => {});
-}
-
-async function flushLogs() {
-  if (logFlushRunning) return;
-  logFlushRunning = true;
-
-  try {
-    const sheets = LOGS_TO_SHEETS ? await getSheets() : null;
-
-    while (logQueue.length) {
-      const payload = logQueue.shift();
-
-      // discord
-      await sendLogToDiscord(payload);
-
-      // sheets
-      if (LOGS_TO_SHEETS && sheets) {
-        await appendLogRowToSheets(sheets, payload).catch(() => {});
-      }
-    }
-  } finally {
-    logFlushRunning = false;
-  }
-}
-
-function logEvent(level, source, action, details, extra = {}) {
-  if (!shouldLog(level)) return;
-
-  const payload = {
-    timestamp: new Date().toISOString(),
-    level,
-    source,
-    action,
-    details: details ? String(details) : "",
-    week: extra.week || "",
-    actorTag: extra.actorTag || "",
-    actorId: extra.actorId || "",
-    guildId: extra.guildId || "",
-    channelId: extra.channelId || "",
-    target: extra.target || "",
-  };
-
-  // console
-  const prefix = `[${payload.level.toUpperCase()}] ${payload.source} • ${payload.action}`;
-  if (level === "error") console.error(prefix, payload.details);
-  else if (level === "warn") console.warn(prefix, payload.details);
-  else console.log(prefix, payload.details);
-
-  // queue => flush
-  logQueue.push(payload);
-  flushLogs().catch(() => {});
-}
-
-// Crash / erreurs globales
-process.on("unhandledRejection", (reason) => {
-  logEvent("error", "process", "unhandledRejection", String(reason || ""));
-});
-
-process.on("uncaughtException", (err) => {
-  logEvent("error", "process", "uncaughtException", String(err?.stack || err || ""));
-});
-
-client.once(Events.ClientReady, async () => {
-  console.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
-console.log("[AUTO] AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
-console.log("[AUTO] AUTO_SYNC_WEEKS_BACK =", process.env.AUTO_SYNC_WEEKS_BACK);
-console.log("[AUTO] AUTO_SYNC_ON_START =", process.env.AUTO_SYNC_ON_START);
-  console.log(`✅ Bot prêt : ${client.user.tag}`);
-  logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`, {});
-  // ===== AUTO-SYNC SCHEDULER =====
-if (AUTO_SYNC) {
-  logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
-
-  if (AUTO_SYNC_ON_START) {
-    runAutoSyncOnce().catch(() => {});
-  }
-
-  setInterval(() => {
-    runAutoSyncOnce().catch(() => {});
-  }, AUTO_SYNC_INTERVAL_SECONDS * 1000);
-}
-});
+const SHEET_BOT_LINKS = "BOT_LINKS";
 
 // ===================== UTILS =====================
-function hasPayRole(member) {
-  return PAY_ROLE_IDS.length > 0 && member?.roles?.cache?.some((r) => PAY_ROLE_IDS.includes(r.id));
+function sha(obj) {
+  return crypto.createHash("sha256").update(JSON.stringify(obj)).digest("hex");
 }
 
-function boolLocked(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return ["true", "vrai", "1", "yes", "oui", "lock", "locked"].includes(s);
+function normName(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 function isSeparatorRow(row) {
@@ -272,150 +98,195 @@ function extractWeek(str) {
   return m ? m[1] : null;
 }
 
-function hashObject(obj) {
-  return crypto.createHash("sha256").update(JSON.stringify(obj)).digest("hex");
+function boolLocked(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return ["true", "vrai", "1", "yes", "oui", "lock", "locked"].includes(s);
 }
 
-function filterChoices(list, focused) {
-  const q = String(focused || "").toLowerCase();
-  const filtered = q ? list.filter((x) => String(x).toLowerCase().includes(q)) : list.slice(0);
-  return filtered.slice(0, 25).map((x) => ({ name: String(x), value: String(x) }));
+function weekToNumber(weekKey) {
+  const m = String(weekKey || "").match(/^(\d{4})-S(\d{2})$/);
+  if (!m) return -1;
+  return Number(m[1]) * 100 + Number(m[2]);
 }
 
-function pickFirst(obj, keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+function sortWeeksDesc(weeks) {
+  return [...new Set(weeks)]
+    .filter((w) => /^(\d{4})-S(\d{2})$/.test(String(w)))
+    .sort((a, b) => weekToNumber(b) - weekToNumber(a));
+}
+
+function filterChoices(values, typed) {
+  const t = String(typed || "").toLowerCase();
+  const out = values
+    .filter((v) => String(v).toLowerCase().includes(t))
+    .slice(0, 25)
+    .map((v) => ({ name: String(v).slice(0, 100), value: String(v).slice(0, 100) }));
+  return out;
+}
+
+function safeMoney(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v ?? "—");
+  return (Math.round(n * 100) / 100).toString();
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ===================== LOGGING =====================
+let _logsChannelCache = null;
+
+async function resolveLogsChannel() {
+  if (!LOGS_CHANNEL_ID) return null;
+  if (_logsChannelCache) return _logsChannelCache;
+  try {
+    const ch = await client.channels.fetch(LOGS_CHANNEL_ID);
+    if (ch && ch.isTextBased?.()) {
+      _logsChannelCache = ch;
+      return ch;
+    }
+  } catch {}
+  return null;
+}
+
+function nowStr() {
+  const d = new Date();
+  return d.toISOString().replace("T", " ").replace("Z", "");
+}
+
+async function logEvent(level, source, action, message, meta = {}) {
+  const line = `[${level.toUpperCase()}] ${source} • ${action} ${message}`;
+  console.log(line);
+
+  const ch = await resolveLogsChannel();
+  if (!ch) return;
+
+  const parts = [];
+  parts.push(`**${level.toUpperCase()}** • **${action}**`);
+  parts.push(`${message}`);
+
+  const metaLines = [];
+  for (const [k, v] of Object.entries(meta || {})) {
+    if (v === undefined || v === null || String(v).trim() === "") continue;
+    metaLines.push(`**${k}**: ${String(v).slice(0, 500)}`);
   }
-  return "";
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${source}`)
+    .setDescription(parts.join("\n"))
+    .addFields(metaLines.slice(0, 20).map((t) => ({ name: "\u200b", value: t })))
+    .setFooter({ text: nowStr() })
+    .setTimestamp(new Date());
+
+  try {
+    await ch.send({ embeds: [embed] });
+  } catch {}
 }
+
+// ===================== GOOGLE: prepare keyfile if base64 env exists =====================
+function ensureKeyfileFromB64() {
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
+  try {
+    const out = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+    fs.writeFileSync(path.join(__dirname, GOOGLE_KEYFILE), out, "utf8");
+    console.log("✅ service-account.json écrit depuis GOOGLE_SERVICE_ACCOUNT_JSON_B64");
+  } catch (e) {
+    console.error("❌ Impossible d'écrire keyfile depuis base64:", e?.message || e);
+  }
+}
+ensureKeyfileFromB64();
 
 // ===================== GOOGLE SHEETS CLIENT =====================
-let sheetsClient = null;
+let _sheets = null;
 
 async function getSheets() {
-  if (sheetsClient) return sheetsClient;
+  if (_sheets) return _sheets;
   const auth = new google.auth.GoogleAuth({
     keyFile: GOOGLE_KEYFILE,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
-  sheetsClient = google.sheets({ version: "v4", auth });
-  return sheetsClient;
+  _sheets = google.sheets({ version: "v4", auth });
+  return _sheets;
 }
 
-async function sheetExists(sheets, title) {
+async function sheetTitles(sheets) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const titles = (meta.data.sheets || []).map((s) => s.properties?.title);
-  return titles.includes(title);
+  return (meta.data.sheets || []).map((s) => s.properties?.title).filter(Boolean);
 }
 
-async function ensureStateSheet(sheets, title) {
-  const exists = await sheetExists(sheets, title);
-  if (exists) return;
+async function ensureSheet(sheets, title, headerRow /* array */) {
+  const titles = await sheetTitles(sheets);
+  if (titles.includes(title)) return;
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title } } }],
-    },
+    requestBody: { requests: [{ addSheet: { properties: { title } } }] },
   });
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${title}!A1:E1`,
-    valueInputOption: "RAW",
-    requestBody: { values: [["key", "week", "messageId", "hash", "updatedAt"]] },
-  });
-}
-
-async function readStateMap(sheets, stateSheetTitle) {
-  await ensureStateSheet(sheets, stateSheetTitle);
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${stateSheetTitle}!A1:E5000`,
-  });
-
-  const rows = res.data.values || [];
-  const map = new Map();
-
-  for (let i = 1; i < rows.length; i++) {
-    const [key, week, messageId, hash] = rows[i] || [];
-    if (!key) continue;
-    map.set(String(key), {
-      key: String(key),
-      week: String(week || ""),
-      messageId: String(messageId || ""),
-      hash: String(hash || ""),
+  if (headerRow?.length) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${title}!A1:${String.fromCharCode(64 + headerRow.length)}1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [headerRow] },
     });
   }
-
-  return map;
 }
 
-async function writeStateMap(sheets, stateSheetTitle, map) {
-  const header = ["key", "week", "messageId", "hash", "updatedAt"];
-  const now = new Date().toISOString();
-
-  const entries = Array.from(map.values())
-    .sort((a, b) => (a.week || "").localeCompare(b.week || "") || (a.key || "").localeCompare(b.key || ""));
-
-  const values = [header];
-  for (const e of entries) {
-    values.push([e.key, e.week, e.messageId, e.hash, now]);
-  }
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${stateSheetTitle}!A1:E${values.length}`,
-    valueInputOption: "RAW",
-    requestBody: { values },
-  });
-}
-
-async function readSheetTable(sheets, sheetName, range = "A1:Z5000") {
+async function readRange(sheets, range) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!${range}`,
+    range,
     valueRenderOption: "UNFORMATTED_VALUE",
   });
   return res.data.values || [];
 }
 
-// ===================== PARSE HISTORIQUES (generic) =====================
-function parseHistory(rows) {
-  if (!rows || rows.length < 2) return { header: [], records: [] };
+async function updateCell(sheets, rangeA1, value) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: rangeA1,
+    valueInputOption: "RAW",
+    requestBody: { values: [[value]] },
+  });
+}
 
-  const header = (rows[0] || []).map((h) => String(h || "").trim());
+// ===================== PARSE HISTORY (generic) =====================
+async function readSheetTable(sheets, sheetName, maxRows = 5000) {
+  return await readRange(sheets, `${sheetName}!A1:Z${maxRows}`);
+}
+
+function parseHistory(table) {
+  const header = (table[0] || []).map((h) => String(h || "").trim());
   const idxWeek = header.indexOf("Semaine");
-
   let currentWeek = null;
+
   const records = [];
 
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i] || [];
+  for (let i = 1; i < table.length; i++) {
+    const row = table[i] || [];
 
-    if (isSeparatorRow(r)) {
-      const w = extractWeek(r[0]);
-      if (w) currentWeek = w;
+    if (isSeparatorRow(row)) {
+      const wk = extractWeek(row[0]);
+      if (wk) currentWeek = wk;
       continue;
     }
 
-    const hasAny = r.some((x) => x !== "" && x !== null && x !== undefined);
-    if (!hasAny) continue;
-
-    const week = idxWeek !== -1 ? String(r[idxWeek] || "") : (currentWeek || "");
-    const weekKey = extractWeek(week) || extractWeek(currentWeek) || "";
+    let weekKey = null;
+    if (idxWeek !== -1) weekKey = extractWeek(row[idxWeek]);
+    if (!weekKey) weekKey = currentWeek;
     if (!weekKey) continue;
 
     const obj = {};
     for (let c = 0; c < header.length; c++) {
-      const colName = header[c] || `COL_${c + 1}`;
-      obj[colName] = r[c] ?? "";
+      const key = header[c];
+      if (!key) continue;
+      obj[key] = row[c];
     }
 
     records.push({
-      rowIndex: i + 1, // 1-based
       week: weekKey,
+      rowIndex: i + 1, // 1-based in sheet
+      raw: row,
       obj,
     });
   }
@@ -423,638 +294,21 @@ function parseHistory(rows) {
   return { header, records };
 }
 
-function buildGenericEmbed(historyLabel, weekKey, record, flavor) {
-  const obj = record.obj || {};
-
-  // Quelques champs "probables" selon historique
-  let title = `${flavor.icon} ${historyLabel} — Ligne ${record.rowIndex}`;
-
-  if (flavor.kind === "commandes") {
-    const clientName = pickFirst(obj, ["Client", "Nom client", "Client / Nom", "Acheteur", "Prénom et nom"]);
-    if (clientName) title = `📦 Commande — ${clientName}`;
-  }
-
-  if (flavor.kind === "rachat_employe" || flavor.kind === "rachat_temp") {
-    const who = pickFirst(obj, ["Prénom et nom", "Employé", "Nom", "Nom employé", "Acheteur"]);
-    if (who) title = `${flavor.icon} ${flavor.title} — ${who}`;
-  }
-
-  const possibleId = pickFirst(obj, [
-    "ID", "Id", "UUID", "Commande ID", "Id commande", "Numéro", "N°", "N° commande", "Référence", "Reference"
-  ]);
-
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(`Semaine: **${weekKey}**${possibleId ? `\nID: **${possibleId}**` : ""}`)
-    .setTimestamp(new Date());
-
-  const fields = [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (!k) continue;
-    if (String(k).trim().toLowerCase() === "semaine") continue;
-
-    const val = String(v ?? "").trim();
-    if (!val) continue;
-
-    const safe = val.length > 900 ? val.slice(0, 900) + "…" : val;
-    fields.push({ name: k, value: safe, inline: safe.length <= 40 });
-
-    if (fields.length >= 20) break;
-  }
-
-  if (fields.length) embed.addFields(fields);
-  return embed;
-}
-
-// ===================== SYNC HISTORIQUE -> DISCORD (generic) =====================
-async function resolveTextChannel(channelId) {
-  if (!channelId) return null;
-  const ch = await client.channels.fetch(channelId).catch(() => null);
-  if (!ch || !ch.isTextBased?.()) return null;
-  return ch;
-}
-
-/**
- * Sync create/edit embeds for one week (or all weeks if weekKey = null)
- */
-async function syncHistory({
-  sheetName,
-  stateSheet,
-  channelId,
-  weekKey, // string or null
-  historyLabel,
-  flavor, // {kind, icon, title}
-}) {
-  const sheets = await getSheets();
-
-  const channel = await resolveTextChannel(channelId);
-  if (!channel) {
-    throw new Error(`Salon Discord introuvable/invalid pour ${historyLabel} (channelId manquant ou mauvais).`);
-  }
-
-  const rows = await readSheetTable(sheets, sheetName);
-  const { records } = parseHistory(rows);
-
-  const targetRecords = weekKey ? records.filter((r) => r.week === weekKey) : records;
-
-  const stateMap = await readStateMap(sheets, stateSheet);
-
-  let created = 0, edited = 0, skipped = 0;
-
-  for (const rec of targetRecords) {
-    const wk = rec.week;
-    const key = `${wk}::ROW_${rec.rowIndex}`; // stable si la feuille append
-    const h = hashObject({ week: wk, obj: rec.obj });
-
-    const prev = stateMap.get(key);
-    const embed = buildGenericEmbed(historyLabel, wk, rec, flavor);
-
-    // inchangé
-    if (prev?.hash === h && prev?.messageId) {
-      skipped++;
-      continue;
-    }
-
-    // edit si messageId existe
-    if (prev?.messageId) {
-      try {
-        const msg = await channel.messages.fetch(prev.messageId);
-        await msg.edit({ embeds: [embed] });
-        edited++;
-        stateMap.set(key, { key, week: wk, messageId: prev.messageId, hash: h });
-        continue;
-      } catch {
-        // si message introuvable -> recreate
-      }
-    }
-
-    // create
-    const msg = await channel.send({ embeds: [embed] });
-    created++;
-    stateMap.set(key, { key, week: wk, messageId: msg.id, hash: h });
-  }
-
-  await writeStateMap(sheets, stateSheet, stateMap);
-
-  return { created, edited, skipped, count: targetRecords.length };
-}
-
-/**
- * Purge old bot messages for a given week that are not in stateSheet keep-list
- */
-async function purgeHistory({
-  stateSheet,
-  channelId,
-  weekKey,
-  scan = 300,
-  historyLabel,
-}) {
-  const sheets = await getSheets();
-  const channel = await resolveTextChannel(channelId);
-  if (!channel) throw new Error(`Salon Discord introuvable/invalid pour ${historyLabel}.`);
-
-  const stateMap = await readStateMap(sheets, stateSheet);
-  const keep = new Set();
-  for (const v of stateMap.values()) {
-    if (String(v.week) === String(weekKey) && /^\d{16,20}$/.test(String(v.messageId))) {
-      keep.add(String(v.messageId));
-    }
-  }
-
-  let deleted = 0, fetched = 0;
-  let lastId = null;
-
-  while (fetched < scan) {
-    const batch = await channel.messages.fetch({
-      limit: Math.min(100, scan - fetched),
-      ...(lastId ? { before: lastId } : {}),
-    });
-
-    if (!batch.size) break;
-
-    for (const msg of batch.values()) {
-      fetched++;
-      lastId = msg.id;
-
-      // uniquement messages du bot
-      if (msg.author?.id !== client.user.id) continue;
-
-      // garder ceux suivis
-      if (keep.has(msg.id)) continue;
-
-      const embedsText = (msg.embeds || [])
-        .map((e) => `${e.title || ""} ${e.description || ""} ${e.footer?.text || ""}`)
-        .join(" ");
-
-      if (embedsText.includes(weekKey)) {
-        try {
-          await msg.delete();
-          deleted++;
-        } catch {}
-      }
-    }
-  }
-
-  return { deleted, scanned: fetched };
-}
-
-/**
- * Count records for a week in a history sheet
- */
-async function countHistoryWeek(sheetName, weekKey) {
-  const sheets = await getSheets();
-  const rows = await readSheetTable(sheets, sheetName);
-  const { records } = parseHistory(rows);
-  return records.filter((r) => r.week === weekKey).length;
-}
-
-// ===================== SALAIRES SPECIFIC (lock/pay/reactions + BOT_STATE) =====================
-function isLockedValue(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return ["true", "vrai", "1", "yes", "oui", "lock", "locked"].includes(s);
-}
-
-async function getBotStateSalairesRows(sheets) {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${BOT_STATE_SALAIRES}!A1:I5000`,
-  });
-  return res.data.values || [];
-}
-
-async function isWeekLocked(sheets, weekKey) {
-  const rows = await getBotStateSalairesRows(sheets);
-  if (rows.length <= 1) return false;
-
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][1]) === String(weekKey)) return isLockedValue(rows[i][7]); // H
-  }
-  return false;
-}
-
-async function lockWeek(sheets, weekKey, lockedValue) {
-  const rows = await getBotStateSalairesRows(sheets);
-  if (rows.length <= 1) return 0;
-
-  let changed = 0;
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][1]) === String(weekKey)) {
-      rows[i][7] = lockedValue ? "true" : "";
-      changed++;
-    }
-  }
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${BOT_STATE_SALAIRES}!A1:I${rows.length}`,
-    valueInputOption: "RAW",
-    requestBody: { values: rows },
-  });
-
-  return changed;
-}
-
-// retrouver week+employe depuis un messageId salaires
-async function findStateByMessageId(sheets, messageId) {
-  const rows = await getBotStateSalairesRows(sheets);
-  if (rows.length <= 1) return null;
-
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i] || [];
-    if (row.some((cell) => String(cell) === String(messageId))) {
-      return {
-        weekKey: row[1] ? String(row[1]) : null,
-        employeName: row[2] ? String(row[2]) : null,
-        locked: isLockedValue(row[7]),
-      };
-    }
-  }
-  return null;
-}
-
-// update statut salaires
-function colLetterFromIndex(idx) {
-  return String.fromCharCode("A".charCodeAt(0) + idx);
-}
-
-async function readSalairesSheet(sheets) {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SALAIRES_SHEET}!A1:Z5000`,
-    valueRenderOption: "UNFORMATTED_VALUE",
-  });
-  return res.data.values || [];
-}
-
-async function updateSalaireStatus(sheets, weekKey, employeName, newStatus) {
-  const rows = await readSalairesSheet(sheets);
-  if (rows.length < 2) throw new Error("Historique salaires vide.");
-
-  const header = rows[0];
-  const idxSemaine = header.indexOf("Semaine");
-  const idxNom = header.indexOf("Prénom et nom");
-  const idxStatut = header.indexOf("Statut au moment de la clôture");
-
-  if (idxSemaine === -1 || idxNom === -1 || idxStatut === -1) {
-    throw new Error("Colonnes introuvables dans Historique salaires.");
-  }
-  if (idxStatut >= 26) throw new Error("Colonne statut au-delà de Z.");
-
-  let targetRowNumber = null;
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    if (isSeparatorRow(r)) continue;
-
-    const sameWeek = String(r[idxSemaine]) === String(weekKey);
-    const sameName = String(r[idxNom] || "").trim().toLowerCase() === String(employeName || "").trim().toLowerCase();
-
-    if (sameWeek && sameName) {
-      targetRowNumber = i + 1;
-      break;
-    }
-  }
-
-  if (!targetRowNumber) return false;
-
-  const col = colLetterFromIndex(idxStatut);
-  const range = `${SALAIRES_SHEET}!${col}${targetRowNumber}`;
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range,
-    valueInputOption: "RAW",
-    requestBody: { values: [[newStatus]] },
-  });
-
-  return true;
-}
-
-// Fix Payé vs Pas payé
-function normalizeFr(str) {
-  return String(str || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-function isPaidStatus(statut) {
-  const s = normalizeFr(statut);
-  if (s === "paye") return true;
-  if (s.startsWith("pas")) return false;
-  return false;
-}
-
-async function computeSalairesStatus(sheets, weekKey) {
-  const rows = await readSalairesSheet(sheets);
-  if (rows.length < 2) return null;
-
-  const header = rows[0];
-  const idxWeek = header.indexOf("Semaine");
-  const idxName = header.indexOf("Prénom et nom");
-  const idxTotalPaye = header.indexOf("Total payé");
-  const idxStatut = header.indexOf("Statut au moment de la clôture");
-  if ([idxWeek, idxName, idxTotalPaye, idxStatut].some((x) => x === -1)) {
-    throw new Error("Colonnes manquantes pour /salairesstatus.");
-  }
-
-  const people = [];
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    if (isSeparatorRow(r)) continue;
-    if (String(r[idxWeek]) !== String(weekKey)) continue;
-
-    people.push({
-      name: String(r[idxName] || ""),
-      totalPaye: Number(r[idxTotalPaye] || 0),
-      statut: String(r[idxStatut] || ""),
-    });
-  }
-
-  const paid = people.filter((p) => isPaidStatus(p.statut)).length;
-  const unpaid = people.length - paid;
-  const total = people.reduce((s, p) => s + (Number.isFinite(p.totalPaye) ? p.totalPaye : 0), 0);
-
-  return { count: people.length, paid, unpaid, total };
-}
-
-// ===================== BOT_LINKS =====================
-async function ensureLinksSheetExists(sheets) {
-  const exists = await sheetExists(sheets, LINKS_SHEET);
-  if (exists) return;
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: { requests: [{ addSheet: { properties: { title: LINKS_SHEET } } }] },
-  });
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LINKS_SHEET}!A1:E1`,
-    valueInputOption: "RAW",
-    requestBody: {
-      values: [["telegramme", "employeName", "discordUserId", "active", "updatedAt"]],
-    },
-  });
-}
-
-async function readLinks(sheets) {
-  await ensureLinksSheetExists(sheets);
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LINKS_SHEET}!A1:E2000`,
-  });
-  return res.data.values || [];
-}
-
-async function upsertLink(sheets, { telegramme, employeName, discordUserId, active }) {
-  const rows = await readLinks(sheets);
-  const now = new Date().toISOString();
-  const newRow = [telegramme || "", employeName || "", discordUserId, active ? "true" : "false", now];
-
-  if (rows.length <= 1) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${LINKS_SHEET}!A:E`,
-      valueInputOption: "RAW",
-      insertDataOption: "INSERT_ROWS",
-      requestBody: { values: [newRow] },
-    });
-    return { action: "created" };
-  }
-
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][2] || "") === String(discordUserId)) {
-      const rowIndex = i + 1;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${LINKS_SHEET}!A${rowIndex}:E${rowIndex}`,
-        valueInputOption: "RAW",
-        requestBody: { values: [newRow] },
-      });
-      return { action: "updated" };
-    }
-  }
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LINKS_SHEET}!A:E`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [newRow] },
-  });
-  return { action: "created" };
-}
-
-async function deactivateLink(sheets, discordUserId) {
-  const rows = await readLinks(sheets);
-  if (rows.length <= 1) return { action: "not_found" };
-
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][2] || "") === String(discordUserId)) {
-      const rowIndex = i + 1;
-      const now = new Date().toISOString();
-      const updated = [rows[i][0] || "", rows[i][1] || "", String(discordUserId), "false", now];
-
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${LINKS_SHEET}!A${rowIndex}:E${rowIndex}`,
-        valueInputOption: "RAW",
-        requestBody: { values: [updated] },
-      });
-      return { action: "disabled" };
-    }
-  }
-  return { action: "not_found" };
-}
-
-async function deleteLinkRow(sheets, discordUserId) {
-  await ensureLinksSheetExists(sheets);
-
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const linkSheet = (meta.data.sheets || []).find((s) => s.properties?.title === LINKS_SHEET);
-  if (!linkSheet) return { action: "not_found_sheet" };
-  const sheetId = linkSheet.properties.sheetId;
-
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${LINKS_SHEET}!A1:E2000`,
-  });
-  const rows = res.data.values || [];
-  if (rows.length <= 1) return { action: "not_found" };
-
-  let rowIndex1Based = null;
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][2] || "") === String(discordUserId)) {
-      rowIndex1Based = i + 1;
-      break;
-    }
-  }
-  if (!rowIndex1Based) return { action: "not_found" };
-
-  const startIndex = rowIndex1Based - 1;
-  const endIndex = startIndex + 1;
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [
-        {
-          deleteDimension: {
-            range: { sheetId, dimension: "ROWS", startIndex, endIndex },
-          },
-        },
-      ],
-    },
-  });
-
-  return { action: "deleted" };
-}
-
-async function getEmployeNameByDiscordId(sheets, discordUserId) {
-  const rows = await readLinks(sheets);
-  for (let i = 1; i < rows.length; i++) {
-    const userId = rows[i][2];
-    const active = String(rows[i][3] || "").toLowerCase();
-    const employeName = rows[i][1];
-
-    if (String(userId) === String(discordUserId) && active === "true" && employeName) {
-      return String(employeName);
-    }
-  }
-  return null;
-}
-
-// ===================== AUTOCOMPLETE CACHE =====================
-const cache = {
-  weeks: { ts: 0, data: [] },
-  employeesByWeek: new Map(),
-};
-
-async function getWeeksUnion(sheets) {
-  const now = Date.now();
-  if (now - cache.weeks.ts < 60_000 && cache.weeks.data.length) return cache.weeks.data;
-
-  const set = new Set();
-  const sheetsToScan = [SALAIRES_SHEET, COMMANDES_SHEET, RACHAT_EMPLOYE_SHEET, RACHAT_TEMPORAIRE_SHEET];
-
-  for (const sheetName of sheetsToScan) {
-    try {
-      const rows = await readSheetTable(sheets, sheetName);
-      const { records } = parseHistory(rows);
-      for (const r of records) set.add(r.week);
-    } catch {}
-  }
-
-  const weeks = Array.from(set).sort();
-  cache.weeks = { ts: now, data: weeks };
-  return weeks;
-}
-
-async function getEmployeesForWeek(sheets, weekKey) {
-  const now = Date.now();
-  const cached = cache.employeesByWeek.get(weekKey);
-  if (cached && now - cached.ts < 60_000) return cached.data;
-
-  const rows = await readSalairesSheet(sheets);
-  if (rows.length < 2) return [];
-
-  const header = rows[0];
-  const idxWeek = header.indexOf("Semaine");
-  const idxName = header.indexOf("Prénom et nom");
-  if (idxWeek === -1 || idxName === -1) return [];
-
-  const names = [];
-  for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    if (isSeparatorRow(r)) continue;
-    if (String(r[idxWeek]) === String(weekKey) && r[idxName]) names.push(String(r[idxName]));
-  }
-
-  const unique = [...new Set(names)].sort();
-  cache.employeesByWeek.set(weekKey, { ts: now, data: unique });
-  return unique;
-}
-
-// ===================== AUTOCOMPLETE HANDLER (safe) =====================
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isAutocomplete()) return;
-
-  const startedAt = Date.now();
-
-  try {
-    const sheets = await getSheets();
-    const focused = interaction.options.getFocused(true);
-
-    // anti-timeout : si on est déjà trop lent, on répond vide (sinon "Unknown interaction")
-    const tooLate = () => (Date.now() - startedAt) > 2500;
-
-    if (focused.name === "semaine") {
-      if (tooLate()) return;
-
-      const weeks = await getWeeksUnion(sheets);
-
-      if (tooLate()) {
-        // Discord a probablement déjà expiré l’interaction -> on ne tente pas de respond
-        return;
-      }
-
-      await interaction.respond(filterChoices(weeks, focused.value)).catch((err) => {
-        // 10062 = interaction expirée => on ignore
-        if (err?.code === 10062) return;
-        // tout le reste: on log mais sans crash
-        logEvent("warn", "autocomplete", "respond_error", String(err?.stack || err || ""));
-      });
-      return;
-    }
-
-    if (focused.name === "employe") {
-      const weekKey = interaction.options.getString("semaine");
-      if (!weekKey) {
-        await interaction.respond([]).catch(() => {});
-        return;
-      }
-
-      if (tooLate()) return;
-
-      const emps = await getEmployeesForWeek(sheets, weekKey);
-
-      if (tooLate()) return;
-
-      await interaction.respond(filterChoices(emps, focused.value)).catch((err) => {
-        if (err?.code === 10062) return;
-        logEvent("warn", "autocomplete", "respond_error", String(err?.stack || err || ""));
-      });
-      return;
-    }
-
-    // fallback
-    await interaction.respond([]).catch(() => {});
-  } catch (e) {
-    // on n’essaie PAS de re-répondre si ça a planté; on log juste
-    logEvent("warn", "autocomplete", "handler_error", String(e?.stack || e || ""));
-    try { await interaction.respond([]); } catch {}
-  }
-});
-
-// ===================== SYNC SALAIRES (dans le bot) =====================
-
-// cache liens (BOT_LINKS) pour éviter de relire Sheets 10x
+// ===================== LINKS (BOT_LINKS) =====================
 let _linksCache = { ts: 0, map: new Map() };
 
-function normName(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
+async function readLinks(sheets) {
+  // BOT_LINKS: telegramme | employeName | discordUserId | active | updatedAt
+  await ensureSheet(sheets, SHEET_BOT_LINKS, ["telegramme", "employeName", "discordUserId", "active", "updatedAt"]);
+  return await readRange(sheets, `${SHEET_BOT_LINKS}!A1:E2000`);
 }
 
 async function getLinksMapCached(sheets) {
   const now = Date.now();
   if (now - _linksCache.ts < 60_000 && _linksCache.map.size) return _linksCache.map;
 
-  const rows = await readLinks(sheets); // déjà dans ton bot.js
-  const map = new Map(); // employeName(normalisé) -> discordUserId
+  const rows = await readLinks(sheets);
+  const map = new Map();
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
@@ -1071,13 +325,242 @@ async function getLinksMapCached(sheets) {
   return map;
 }
 
-function formatMoney(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return String(v ?? "");
-  return (Math.round(n * 100) / 100).toString();
+async function upsertLink(sheets, { telegramme, employeName, discordUserId, active }) {
+  const rows = await readLinks(sheets);
+  const now = new Date().toISOString();
+
+  // match by discordUserId
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[2] || "") === String(discordUserId)) {
+      const rowNum = i + 1;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_BOT_LINKS}!A${rowNum}:E${rowNum}`,
+        valueInputOption: "RAW",
+        requestBody: { values: [[telegramme || "", employeName || "", String(discordUserId), String(!!active), now]] },
+      });
+      _linksCache = { ts: 0, map: new Map() };
+      return { action: "updated" };
+    }
+  }
+
+  // append
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_BOT_LINKS}!A1`,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [[telegramme || "", employeName || "", String(discordUserId), String(!!active), now]] },
+  });
+
+  _linksCache = { ts: 0, map: new Map() };
+  return { action: "created" };
 }
 
-function buildSalaireEmbedFromRow(weekKey, obj) {
+async function deactivateLink(sheets, discordUserId) {
+  const rows = await readLinks(sheets);
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[2] || "") === String(discordUserId)) {
+      const rowNum = i + 1;
+      await updateCell(sheets, `${SHEET_BOT_LINKS}!D${rowNum}`, "false");
+      await updateCell(sheets, `${SHEET_BOT_LINKS}!E${rowNum}`, new Date().toISOString());
+      _linksCache = { ts: 0, map: new Map() };
+      return { action: "disabled" };
+    }
+  }
+  return { action: "not_found" };
+}
+
+async function deleteLinkRow(sheets, discordUserId) {
+  // suppression “ligne” via batchUpdate (deleteDimension)
+  const rows = await readLinks(sheets);
+
+  // besoin sheetId
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sheet = (meta.data.sheets || []).find((s) => s.properties?.title === SHEET_BOT_LINKS);
+  if (!sheet) return { action: "no_sheet" };
+  const sheetId = sheet.properties.sheetId;
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[2] || "") === String(discordUserId)) {
+      const startIndex = i; // 0-based, skip header => i is correct
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        requestBody: {
+          requests: [{
+            deleteDimension: {
+              range: {
+                sheetId,
+                dimension: "ROWS",
+                startIndex,
+                endIndex: startIndex + 1,
+              },
+            },
+          }],
+        },
+      });
+      _linksCache = { ts: 0, map: new Map() };
+      return { action: "deleted" };
+    }
+  }
+
+  return { action: "not_found" };
+}
+
+async function getEmployeNameByDiscordId(sheets, discordUserId) {
+  const rows = await readLinks(sheets);
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[2] || "") === String(discordUserId)) {
+      const active = String(r[3] || "").toLowerCase() === "true";
+      if (!active) return null;
+      return String(r[1] || "").trim() || null;
+    }
+  }
+  return null;
+}
+
+// ===================== BOT_STATE helpers =====================
+async function ensureStateSheet(sheets, title) {
+  await ensureSheet(sheets, title, ["key", "week", "name", "channelId", "messageId", "locked", "hash"]);
+}
+
+async function ensureStateSheetSalaires(sheets) {
+  await ensureSheet(sheets, SHEET_BOT_STATE_SALAIRES, [
+    "key", "week", "employeName", "grade", "telegramme", "channelId", "messageId", "locked", "hash",
+  ]);
+}
+
+async function readStateRows(sheets, sheetTitle, max = 5000) {
+  await ensureStateSheet(sheets, sheetTitle);
+  const rows = await readRange(sheets, `${sheetTitle}!A1:G${max}`);
+  return rows;
+}
+
+async function readStateRowsSalaires(sheets, max = 5000) {
+  await ensureStateSheetSalaires(sheets);
+  const rows = await readRange(sheets, `${SHEET_BOT_STATE_SALAIRES}!A1:I${max}`);
+  return rows;
+}
+
+// ===================== DISCORD CLIENT =====================
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  partials: [Partials.Channel],
+});
+
+async function resolveTextChannel(channelId) {
+  if (!channelId) return null;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    if (ch && ch.isTextBased?.()) return ch;
+  } catch {}
+  return null;
+}
+
+function hasPayRole(member) {
+  // allow admins/guild owner too
+  try {
+    if (!member) return false;
+    if (member.permissions?.has?.("Administrator")) return true;
+    if (!PAY_ROLE_IDS.length) return true; // si tu n'as pas configuré PAY_ROLE_IDS -> autorise
+    const roles = member.roles?.cache;
+    if (!roles) return false;
+    return PAY_ROLE_IDS.some((id) => roles.has(id));
+  } catch {
+    return false;
+  }
+}
+
+// ===================== SALAIRES: status / lock / update =====================
+async function isWeekLocked(sheets, weekKey) {
+  const rows = await readStateRowsSalaires(sheets);
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[1] || "") !== String(weekKey)) continue;
+    if (boolLocked(r[7])) return true;
+  }
+  return false;
+}
+
+async function lockWeek(sheets, weekKey, lockValue) {
+  const rows = await readStateRowsSalaires(sheets);
+  let changed = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (String(r[1] || "") !== String(weekKey)) continue;
+    r[7] = lockValue ? "true" : "";
+    changed++;
+  }
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_BOT_STATE_SALAIRES}!A1:I${rows.length}`,
+    valueInputOption: "RAW",
+    requestBody: { values: rows },
+  });
+  return changed;
+}
+
+async function computeSalairesStatus(sheets, weekKey) {
+  const table = await readSheetTable(sheets, SHEET_SALAIRES);
+  const { header, records } = parseHistory(table);
+
+  const idxStatut = header.indexOf("Statut au moment de la clôture");
+  const idxTotalPaye = header.indexOf("Total payé");
+
+  let count = 0;
+  let paid = 0;
+  let unpaid = 0;
+  let total = 0;
+
+  for (const r of records) {
+    if (r.week !== weekKey) continue;
+    const name = String(r.obj["Prénom et nom"] || "").trim();
+    if (!name) continue;
+
+    count++;
+    const statut = idxStatut !== -1 ? String(r.obj[header[idxStatut]] || "") : String(r.obj["Statut au moment de la clôture"] || "");
+    if (statut.toLowerCase().includes("pay")) paid++;
+    else unpaid++;
+
+    const tp = idxTotalPaye !== -1 ? r.obj[header[idxTotalPaye]] : r.obj["Total payé"];
+    total += Number(tp) || 0;
+  }
+
+  return { count, paid, unpaid, total: safeMoney(total) };
+}
+
+async function updateSalaireStatus(sheets, weekKey, employeName, newStatus) {
+  const table = await readSheetTable(sheets, SHEET_SALAIRES);
+  const { header, records } = parseHistory(table);
+
+  const idxStatut = header.indexOf("Statut au moment de la clôture");
+  const idxName = header.indexOf("Prénom et nom");
+  const idxWeek = header.indexOf("Semaine");
+
+  if (idxStatut === -1 || idxName === -1 || idxWeek === -1) {
+    throw new Error("Colonnes manquantes dans Historique salaires (Semaine/Prénom et nom/Statut...)");
+  }
+
+  for (const r of records) {
+    if (r.week !== weekKey) continue;
+    const n = String(r.obj[header[idxName]] || "").trim();
+    if (normName(n) !== normName(employeName)) continue;
+
+    const colLetter = String.fromCharCode(65 + idxStatut); // A=0
+    const range = `${SHEET_SALAIRES}!${colLetter}${r.rowIndex}`;
+    await updateCell(sheets, range, newStatus);
+    return true;
+  }
+
+  return false;
+}
+
+// ===================== EMBEDS =====================
+function buildSalaireEmbed(weekKey, obj) {
   const grade = String(obj["Grade"] || "");
   const name = String(obj["Prénom et nom"] || "");
   const tel = String(obj["Télégramme"] || "");
@@ -1092,11 +575,11 @@ function buildSalaireEmbedFromRow(weekKey, obj) {
     )
     .addFields(
       { name: "Production", value: String(obj["Quantité totale produite"] ?? "—"), inline: true },
-      { name: "Salaire", value: formatMoney(obj["Salaire"]), inline: true },
-      { name: "Prime", value: formatMoney(obj["Prime"]), inline: true },
+      { name: "Salaire", value: safeMoney(obj["Salaire"]), inline: true },
+      { name: "Prime", value: safeMoney(obj["Prime"]), inline: true },
       { name: "Total rachat", value: String(obj["Total rachat"] ?? "—"), inline: true },
-      { name: "Montant rachat", value: formatMoney(obj["Montant rachat"]), inline: true },
-      { name: "Total payé", value: formatMoney(obj["Total payé"]), inline: true },
+      { name: "Montant rachat", value: safeMoney(obj["Montant rachat"]), inline: true },
+      { name: "Total payé", value: safeMoney(obj["Total payé"]), inline: true },
     )
     .setFooter({ text: `LGW • Salaires • ${weekKey}` })
     .setTimestamp(new Date());
@@ -1104,124 +587,143 @@ function buildSalaireEmbedFromRow(weekKey, obj) {
   return embed;
 }
 
+function guessTitle(obj, fallback) {
+  const candidates = [
+    "Prénom et nom",
+    "Client",
+    "Nom du client",
+    "Nom",
+    "Employé",
+    "Produit",
+    "Libellé",
+    "Référence",
+  ];
+  for (const k of candidates) {
+    const v = obj[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+  }
+  return fallback;
+}
+
+function buildGenericEmbed(kind, icon, weekKey, obj) {
+  const title = guessTitle(obj, `${kind} — ${weekKey}`);
+  const embed = new EmbedBuilder()
+    .setTitle(`${icon} ${title}`)
+    .setDescription(`📌 Semaine: **${weekKey}**`)
+    .setFooter({ text: `LGW • ${kind} • ${weekKey}` })
+    .setTimestamp(new Date());
+
+  // Ajoute des champs (max 20)
+  const fields = [];
+  const entries = Object.entries(obj || {});
+  for (const [k, v] of entries) {
+    if (!k) continue;
+    if (k.toLowerCase() === "semaine") continue;
+    const val = v === undefined || v === null || String(v).trim() === "" ? "—" : String(v);
+    fields.push({ name: String(k).slice(0, 256), value: val.slice(0, 1024), inline: true });
+    if (fields.length >= 18) break;
+  }
+
+  if (fields.length) embed.addFields(fields);
+  return embed;
+}
+
+// ===================== SYNC: SALAIRES (BOT_STATE) =====================
 async function syncSalairesWeek(weekKey) {
-  if (!SALAIRES_CHANNEL_ID) throw new Error("SALAIRES_CHANNEL_ID manquant dans .env");
-
   const sheets = await getSheets();
-  const channel = await resolveTextChannel(SALAIRES_CHANNEL_ID);
-  if (!channel) throw new Error("Salon salaires invalide.");
+  await ensureStateSheetSalaires(sheets);
 
-  // sécurité lock semaine
+  if (!SALAIRES_CHANNEL_ID) throw new Error("SALAIRES_CHANNEL_ID manquant (env).");
+
   if (await isWeekLocked(sheets, weekKey)) {
     return { locked: true, created: 0, edited: 0, skipped: 0 };
   }
 
-  // lire salaires
-  const rows = await readSheetTable(sheets, SALAIRES_SHEET);
-  const { header, records } = parseHistory(rows);
+  const ch = await resolveTextChannel(SALAIRES_CHANNEL_ID);
+  if (!ch) throw new Error("Salon salaires invalide.");
 
-  // on ne garde que cette semaine + uniquement les lignes qui ont un nom
+  const table = await readSheetTable(sheets, SHEET_SALAIRES);
+  const { records } = parseHistory(table);
+
   const weekRecords = records
     .filter((r) => r.week === weekKey)
-    .filter((r) => String(r.obj?.["Prénom et nom"] || "").trim() !== "");
-
-  // état BOT_STATE (salaires) déjà géré dans ton bot.js
-  // On réutilise BOT_STATE salaires tel que ton bot le lit (A..I)
-  const stateRows = await getBotStateSalairesRows(sheets);
-
-  // si BOT_STATE vide => pas de header => on init
-  if (!stateRows.length) {
-    // si ton bot n'a jamais initialisé BOT_STATE, on force une base compatible
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${BOT_STATE_SALAIRES}!A1:I1`,
-      valueInputOption: "RAW",
-      requestBody: {
-        values: [[
-          "key","week","employeName","grade","telegramme","channelId","messageId","locked","hash"
-        ]],
-      },
-    });
-  }
-
-  // relire après init éventuelle
-  const stateRows2 = await getBotStateSalairesRows(sheets);
-  const headerState = stateRows2[0] || [];
-  const dataState = stateRows2.slice(1);
-
-  // index colonnes BOT_STATE
-  const idxKey = 0, idxWeek = 1, idxName = 2, idxGrade = 3, idxTel = 4, idxChan = 5, idxMsg = 6, idxLocked = 7, idxHash = 8;
-
-  // map key -> { rowIndexInData, row }
-  const map = new Map();
-  for (let i = 0; i < dataState.length; i++) {
-    const row = dataState[i] || [];
-    const k = String(row[idxKey] || "");
-    if (k) map.set(k, { i, row });
-  }
+    .filter((r) => String(r.obj["Prénom et nom"] || "").trim() !== "");
 
   const linksMap = await getLinksMapCached(sheets);
+
+  const stateRows = await readStateRowsSalaires(sheets);
+  const header = stateRows[0] || [];
+  const data = stateRows.slice(1);
+
+  // map key -> { idx, row }
+  const map = new Map();
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i] || [];
+    const k = String(row[0] || "");
+    if (k) map.set(k, { i, row });
+  }
 
   let created = 0, edited = 0, skipped = 0;
 
   for (const rec of weekRecords) {
     const employeName = String(rec.obj["Prénom et nom"] || "").trim();
     const key = `${weekKey}::${normName(employeName)}`;
-    const newHash = hashObject({ week: weekKey, obj: rec.obj });
+
+    const newHash = sha({
+      week: weekKey,
+      obj: rec.obj,
+    });
 
     const st = map.get(key);
-    const oldHash = st?.row?.[idxHash] ? String(st.row[idxHash]) : "";
-    const oldMsgId = st?.row?.[idxMsg] ? String(st.row[idxMsg]) : "";
-    const oldLocked = st?.row?.[idxLocked];
+    const oldMsgId = st?.row?.[6] ? String(st.row[6]) : "";
+    const oldLocked = st?.row?.[7];
+    const oldHash = st?.row?.[8] ? String(st.row[8]) : "";
 
     if (boolLocked(oldLocked)) {
       skipped++;
       continue;
     }
 
-    // inchangé
     if (oldMsgId && oldHash === newHash) {
       skipped++;
       continue;
     }
 
-    const embed = buildSalaireEmbedFromRow(weekKey, rec.obj);
-
     const discordUserId = linksMap.get(normName(employeName));
     const mention = discordUserId ? `<@${discordUserId}>` : "";
+    const embed = buildSalaireEmbed(weekKey, rec.obj);
 
-    // essayer d’éditer si message existe
+    // edit si possible
     if (oldMsgId) {
       try {
-        const msg = await channel.messages.fetch(oldMsgId);
+        const msg = await ch.messages.fetch(oldMsgId);
         await msg.edit({
-          content: mention,               // ne re-ping pas, mais garde affiché
+          content: mention,               // ne reping pas (normal)
           embeds: [embed],
           allowedMentions: { parse: [] }, // évite ping sur edit
         });
 
         edited++;
 
-        // update state row
         const row = st.row;
-        row[idxKey] = key;
-        row[idxWeek] = weekKey;
-        row[idxName] = employeName;
-        row[idxGrade] = String(rec.obj["Grade"] || "");
-        row[idxTel] = String(rec.obj["Télégramme"] || "");
-        row[idxChan] = SALAIRES_CHANNEL_ID;
-        row[idxMsg] = oldMsgId;
-        row[idxLocked] = ""; // unlocked
-        row[idxHash] = newHash;
+        row[0] = key;
+        row[1] = weekKey;
+        row[2] = employeName;
+        row[3] = String(rec.obj["Grade"] || "");
+        row[4] = String(rec.obj["Télégramme"] || "");
+        row[5] = SALAIRES_CHANNEL_ID;
+        row[6] = oldMsgId;
+        row[7] = ""; // unlocked
+        row[8] = newHash;
 
         continue;
       } catch {
-        // message supprimé => on va recréer (et ping)
+        // message supprimé => on crée (et ping)
       }
     }
 
-    // create => ping à chaque création
-    const newMsg = await channel.send({
+    // create => ping à la création
+    const msg = await ch.send({
       content: mention,
       embeds: [embed],
       allowedMentions: discordUserId ? { users: [discordUserId] } : { parse: [] },
@@ -1231,37 +733,37 @@ async function syncSalairesWeek(weekKey) {
 
     if (st) {
       const row = st.row;
-      row[idxMsg] = newMsg.id;
-      row[idxHash] = newHash;
-      row[idxChan] = SALAIRES_CHANNEL_ID;
-      row[idxWeek] = weekKey;
-      row[idxName] = employeName;
-      row[idxGrade] = String(rec.obj["Grade"] || "");
-      row[idxTel] = String(rec.obj["Télégramme"] || "");
-      row[idxLocked] = "";
+      row[0] = key;
+      row[1] = weekKey;
+      row[2] = employeName;
+      row[3] = String(rec.obj["Grade"] || "");
+      row[4] = String(rec.obj["Télégramme"] || "");
+      row[5] = SALAIRES_CHANNEL_ID;
+      row[6] = msg.id;
+      row[7] = ""; // unlocked
+      row[8] = newHash;
     } else {
-      dataState.push([
+      data.push([
         key,
         weekKey,
         employeName,
         String(rec.obj["Grade"] || ""),
         String(rec.obj["Télégramme"] || ""),
         SALAIRES_CHANNEL_ID,
-        newMsg.id,
+        msg.id,
         "",
         newHash,
       ]);
     }
   }
 
-  // réécriture BOT_STATE
-  const newState = [headerState.length ? headerState : [
-    "key","week","employeName","grade","telegramme","channelId","messageId","locked","hash"
-  ], ...dataState];
+  const newState = [header.length ? header : [
+    "key", "week", "employeName", "grade", "telegramme", "channelId", "messageId", "locked", "hash",
+  ], ...data];
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${BOT_STATE_SALAIRES}!A1:I${newState.length}`,
+    range: `${SHEET_BOT_STATE_SALAIRES}!A1:I${newState.length}`,
     valueInputOption: "RAW",
     requestBody: { values: newState },
   });
@@ -1269,45 +771,269 @@ async function syncSalairesWeek(weekKey) {
   return { locked: false, created, edited, skipped };
 }
 
-// ===================== COMMANDES HANDLER (Slash commands) =====================
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+// ===================== SYNC: GENERIC (Commandes / Rachats) =====================
+async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind, icon }) {
+  const sheets = await getSheets();
+  await ensureStateSheet(sheets, stateSheet);
 
-  const cmd = interaction.commandName; // dispo même si ça crash après
+  if (!channelId) throw new Error(`${kind}: channelId manquant (env).`);
+  const ch = await resolveTextChannel(channelId);
+  if (!ch) throw new Error(`${kind}: salon invalide.`);
 
-  // log entrée commande
-  logEvent("info", "command", `/${cmd}`, "Commande reçue", {
-    actorTag: interaction.user?.tag,
-    actorId: interaction.user?.id,
-    guildId: interaction.guildId,
-    channelId: interaction.channelId,
+  const table = await readSheetTable(sheets, sheetName);
+  const { records } = parseHistory(table);
+  const weekRecords = records.filter((r) => r.week === weekKey);
+
+  const stateRows = await readStateRows(sheets, stateSheet);
+  const header = stateRows[0] || [];
+  const data = stateRows.slice(1);
+
+  // state columns: key, week, name, channelId, messageId, locked, hash
+  const map = new Map();
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i] || [];
+    const k = String(row[0] || "");
+    if (k) map.set(k, { i, row });
+  }
+
+  let created = 0, edited = 0, skipped = 0;
+
+  for (const rec of weekRecords) {
+    // key = week + rowIndex (stable) + short hash of row
+    const key = `${weekKey}::${sheetName}::row${rec.rowIndex}`;
+    const newHash = sha({ week: weekKey, obj: rec.obj });
+
+    const st = map.get(key);
+    const oldMsgId = st?.row?.[4] ? String(st.row[4]) : "";
+    const oldLocked = st?.row?.[5];
+    const oldHash = st?.row?.[6] ? String(st.row[6]) : "";
+
+    if (boolLocked(oldLocked)) {
+      skipped++;
+      continue;
+    }
+
+    if (oldMsgId && oldHash === newHash) {
+      skipped++;
+      continue;
+    }
+
+    const embed = buildGenericEmbed(kind, icon, weekKey, rec.obj);
+
+    if (oldMsgId) {
+      try {
+        const msg = await ch.messages.fetch(oldMsgId);
+        await msg.edit({ embeds: [embed] });
+        edited++;
+
+        const row = st.row;
+        row[0] = key;
+        row[1] = weekKey;
+        row[2] = guessTitle(rec.obj, `${kind} ${rec.rowIndex}`);
+        row[3] = channelId;
+        row[4] = oldMsgId;
+        row[5] = "";
+        row[6] = newHash;
+
+        continue;
+      } catch {
+        // message supprimé => create
+      }
+    }
+
+    const msg = await ch.send({ embeds: [embed] });
+    created++;
+
+    if (st) {
+      const row = st.row;
+      row[0] = key;
+      row[1] = weekKey;
+      row[2] = guessTitle(rec.obj, `${kind} ${rec.rowIndex}`);
+      row[3] = channelId;
+      row[4] = msg.id;
+      row[5] = "";
+      row[6] = newHash;
+    } else {
+      data.push([
+        key,
+        weekKey,
+        guessTitle(rec.obj, `${kind} ${rec.rowIndex}`),
+        channelId,
+        msg.id,
+        "",
+        newHash,
+      ]);
+    }
+  }
+
+  const newState = [header.length ? header : ["key", "week", "name", "channelId", "messageId", "locked", "hash"], ...data];
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${stateSheet}!A1:G${newState.length}`,
+    valueInputOption: "RAW",
+    requestBody: { values: newState },
   });
+
+  return { created, edited, skipped };
+}
+
+// ===================== AUTOCOMPLETE DATA =====================
+async function getWeeksUnion(sheets) {
+  const weeks = [];
+
+  const sheetsToScan = [
+    SHEET_SALAIRES,
+    SHEET_COMMANDES,
+    SHEET_RACHAT_EMPLOYE,
+    SHEET_RACHAT_TEMP,
+  ];
+
+  for (const sn of sheetsToScan) {
+    try {
+      const table = await readSheetTable(sheets, sn, 2000);
+      const { records } = parseHistory(table);
+      for (const r of records) weeks.push(r.week);
+    } catch {
+      // ignore
+    }
+  }
+
+  return sortWeeksDesc(weeks);
+}
+
+async function getEmployeesForWeek(sheets, weekKey) {
+  const table = await readSheetTable(sheets, SHEET_SALAIRES, 3000);
+  const { records } = parseHistory(table);
+  return records
+    .filter((r) => r.week === weekKey)
+    .map((r) => String(r.obj["Prénom et nom"] || "").trim())
+    .filter(Boolean);
+}
+
+// ===================== AUTOSYNC =====================
+let _autoSyncRunning = false;
+
+async function runAutoSyncOnce() {
+  if (_autoSyncRunning) return;
+  _autoSyncRunning = true;
 
   try {
     const sheets = await getSheets();
+    const weeks = (await getWeeksUnion(sheets)).slice(0, Math.max(1, AUTO_SYNC_WEEKS_BACK));
 
-    const adminCommands = new Set([
-      // salaires
-      "lock", "unlock",
-      "pay", "unpay",
-      "payuser", "unpayuser",
-      "salairesstatus",
-      "syncsalaires", "publishsalaires", "purgesalaires",
+    await logEvent("info", "autosync", "run", `Weeks: ${weeks.join(", ")}`);
 
-      // commandes
-      "synccommandes", "publishcommandes", "commandesstatus", "purgecommandes", "synccommandesall",
+    for (const w of weeks) {
+      // Salaires
+      const outSal = await syncSalairesWeek(w);
+      await logEvent("info", "autosync", "salaires", `week=${w} created=${outSal.created} edited=${outSal.edited} skipped=${outSal.skipped} locked=${outSal.locked}`, { week: w });
+      await sleep(500);
 
-      // rachats
-      "syncrachatemploye", "publishrachatemploye", "rachatemployestatus", "purgerachatemploye", "syncrachatemployeall",
-      "syncrachattemp", "publishrachattemp", "rachattempstatus", "purgerachattemp", "syncrachattempall",
+      // Commandes
+      const outCmd = await syncHistoryWeek({
+        weekKey: w,
+        sheetName: SHEET_COMMANDES,
+        stateSheet: SHEET_BOT_STATE_COMMANDES,
+        channelId: COMMANDES_CHANNEL_ID,
+        kind: "Commandes",
+        icon: "📦",
+      });
+      await logEvent("info", "autosync", "commandes", `week=${w} created=${outCmd.created} edited=${outCmd.edited} skipped=${outCmd.skipped}`, { week: w });
+      await sleep(500);
 
-      // links
+      // Rachat employé
+      const outRE = await syncHistoryWeek({
+        weekKey: w,
+        sheetName: SHEET_RACHAT_EMPLOYE,
+        stateSheet: SHEET_BOT_STATE_RACHAT_EMPLOYE,
+        channelId: RACHAT_EMPLOYE_CHANNEL_ID,
+        kind: "Rachat employé",
+        icon: "👤",
+      });
+      await logEvent("info", "autosync", "rachat_employe", `week=${w} created=${outRE.created} edited=${outRE.edited} skipped=${outRE.skipped}`, { week: w });
+      await sleep(500);
+
+      // Rachat temporaire
+      const outRT = await syncHistoryWeek({
+        weekKey: w,
+        sheetName: SHEET_RACHAT_TEMP,
+        stateSheet: SHEET_BOT_STATE_RACHAT_TEMP,
+        channelId: RACHAT_TEMPORAIRE_CHANNEL_ID,
+        kind: "Rachat temporaire",
+        icon: "⏳",
+      });
+      await logEvent("info", "autosync", "rachat_temp", `week=${w} created=${outRT.created} edited=${outRT.edited} skipped=${outRT.skipped}`, { week: w });
+
+      await sleep(800);
+    }
+  } catch (e) {
+    await logEvent("error", "autosync", "run_error", String(e?.stack || e || ""));
+  } finally {
+    _autoSyncRunning = false;
+  }
+}
+
+// ===================== AUTOCOMPLETE HANDLER (safe) =====================
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isAutocomplete()) return;
+
+  const startedAt = Date.now();
+  const tooLate = () => (Date.now() - startedAt) > 2500;
+
+  try {
+    const sheets = await getSheets();
+    const focused = interaction.options.getFocused(true);
+
+    if (focused.name === "semaine") {
+      if (tooLate()) return;
+      const weeks = await getWeeksUnion(sheets);
+      if (tooLate()) return;
+
+      await interaction.respond(filterChoices(weeks, focused.value)).catch((err) => {
+        if (err?.code === 10062) return; // Unknown interaction (expired)
+      });
+      return;
+    }
+
+    if (focused.name === "employe") {
+      const weekKey = interaction.options.getString("semaine");
+      if (!weekKey) return interaction.respond([]).catch(() => {});
+      if (tooLate()) return;
+
+      const emps = await getEmployeesForWeek(sheets, weekKey);
+      if (tooLate()) return;
+
+      await interaction.respond(filterChoices(emps, focused.value)).catch((err) => {
+        if (err?.code === 10062) return;
+      });
+      return;
+    }
+
+    await interaction.respond([]).catch(() => {});
+  } catch {
+    try { await interaction.respond([]); } catch {}
+  }
+});
+
+// ===================== COMMANDES HANDLER =====================
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const cmd = interaction.commandName;
+
+  try {
+    // permissions (tout ce qui touche la compta)
+    const protectedCommands = new Set([
+      "syncsalaires", "salairesstatus", "lock", "unlock", "pay", "unpay", "payuser", "unpayuser",
+      "synccommandes",
+      "syncrachatemploye",
+      "syncrachattemp",
       "link", "unlink", "dellink",
     ]);
 
-    // permission
-    if (adminCommands.has(cmd) && !hasPayRole(interaction.member)) {
-      logEvent("warn", "auth", `/${cmd}`, "Permission refusée", {
+    if (protectedCommands.has(cmd) && !hasPayRole(interaction.member)) {
+      await logEvent("warn", "auth", `/${cmd}`, "Permission refusée", {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
         guildId: interaction.guildId,
@@ -1316,10 +1042,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.reply({ content: "⛔ Tu n’as pas la permission.", ephemeral: true });
     }
 
-    // ===================== BOT_LINKS =====================
+    const sheets = await getSheets();
+
+    // ---------- LINKS ----------
     if (cmd === "link") {
       await interaction.deferReply({ ephemeral: true });
-
       const user = interaction.options.getUser("user");
       const employeName = interaction.options.getString("nom");
       const telegramme = interaction.options.getString("telegramme") || "";
@@ -1333,11 +1060,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         active: isActive,
       });
 
-      logEvent("info", "links", "link", `Lien ${result.action}: ${employeName} <-> ${user.id}`, {
+      await logEvent("info", "links", "link", `Lien ${result.action}: ${employeName} <-> ${user.id}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
         target: `${employeName} | <@${user.id}>`,
       });
 
@@ -1348,15 +1073,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (cmd === "unlink") {
       await interaction.deferReply({ ephemeral: true });
-
       const user = interaction.options.getUser("user");
       const result = await deactivateLink(sheets, user.id);
 
-      logEvent("info", "links", "unlink", `Action=${result.action} user=${user.id}`, {
+      await logEvent("info", "links", "unlink", `Action=${result.action} user=${user.id}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
         target: `<@${user.id}>`,
       });
 
@@ -1369,60 +1091,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (cmd === "dellink") {
       await interaction.deferReply({ ephemeral: true });
-
       const user = interaction.options.getUser("user");
       const result = await deleteLinkRow(sheets, user.id);
 
-      logEvent("info", "links", "dellink", `Action=${result.action} user=${user.id}`, {
+      await logEvent("info", "links", "dellink", `Action=${result.action} user=${user.id}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
         target: `<@${user.id}>`,
       });
 
       if (result.action === "deleted") return interaction.editReply(`🗑️ Ligne supprimée dans BOT_LINKS pour <@${user.id}>.`);
       if (result.action === "not_found") return interaction.editReply(`⚠️ Aucune ligne BOT_LINKS trouvée pour <@${user.id}>.`);
-      return interaction.editReply("⚠️ Impossible de supprimer (onglet BOT_LINKS introuvable).");
+      return interaction.editReply("⚠️ Impossible (onglet BOT_LINKS introuvable).");
     }
 
-    // ===================== SALAIRES: LOCK / UNLOCK =====================
-    if (cmd === "lock" || cmd === "unlock") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const semaine = interaction.options.getString("semaine");
-      const changed = await lockWeek(sheets, semaine, cmd === "lock");
-
-      logEvent("info", "salaires", cmd, `${semaine} -> ${cmd.toUpperCase()} (${changed} lignes)`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(
-        cmd === "lock"
-          ? `✅ Semaine **${semaine}** verrouillée (${changed} lignes).`
-          : `✅ Semaine **${semaine}** déverrouillée (${changed} lignes).`
-      );
-    }
-
-    // ===================== SALAIRES STATUS =====================
+    // ---------- SALAIRES STATUS ----------
     if (cmd === "salairesstatus") {
       await interaction.deferReply({ ephemeral: true });
-
       const semaine = interaction.options.getString("semaine");
       const locked = await isWeekLocked(sheets, semaine);
       const st = await computeSalairesStatus(sheets, semaine);
-      if (!st) return interaction.editReply("❌ Impossible de lire les salaires.");
 
-      logEvent("info", "salaires", "status", `week=${semaine} locked=${locked} paid=${st.paid} unpaid=${st.unpaid} total=${st.total}`, {
-        week: semaine,
+      await logEvent("info", "salaires", "status", `week=${semaine} locked=${locked} paid=${st.paid} unpaid=${st.unpaid} total=${st.total}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        week: semaine,
       });
 
       return interaction.editReply(
@@ -1433,474 +1126,166 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    // ===================== SALAIRES SYNC/PUBLISH (info) =====================
-    if (cmd === "syncsalaires" || cmd === "publishsalaires") {
-  await interaction.deferReply({ ephemeral: true });
-
-  const semaine = interaction.options.getString("semaine");
-
-  const out = await syncSalairesWeek(semaine);
-
-  if (out.locked) {
-    logEvent("warn", "salaires", cmd, `Refusé (LOCK) week=${semaine}`, {
-      week: semaine,
-      actorTag: interaction.user?.tag,
-      actorId: interaction.user?.id,
-      guildId: interaction.guildId,
-      channelId: interaction.channelId,
-    });
-    return interaction.editReply(`⛔ Semaine **${semaine}** verrouillée.`);
-  }
-
-  logEvent("info", "salaires", cmd, `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-    week: semaine,
-    actorTag: interaction.user?.tag,
-    actorId: interaction.user?.id,
-    guildId: interaction.guildId,
-    channelId: interaction.channelId,
-  });
-
-  return interaction.editReply(
-    `✅ Salaires **${semaine}** → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}\n` +
-    `📌 Ping uniquement sur les créations (limite Discord)`
-  );
-}
-
-    // ===================== SALAIRES PURGE =====================
-    if (cmd === "purgesalaires") {
+    // ---------- LOCK / UNLOCK ----------
+    if (cmd === "lock" || cmd === "unlock") {
       await interaction.deferReply({ ephemeral: true });
-
       const semaine = interaction.options.getString("semaine");
-      const scan = interaction.options.getInteger("scan") ?? 300;
+      const changed = await lockWeek(sheets, semaine, cmd === "lock");
 
-      if (!SALAIRES_CHANNEL_ID) return interaction.editReply("❌ SALAIRES_CHANNEL_ID manquant dans .env");
-
-      const channel = await resolveTextChannel(SALAIRES_CHANNEL_ID);
-      if (!channel) return interaction.editReply("❌ Salon salaires invalide.");
-
-      const stateRows = await getBotStateSalairesRows(sheets);
-      const keep = new Set();
-      for (let i = 1; i < stateRows.length; i++) {
-        const row = stateRows[i] || [];
-        if (String(row[1]) !== String(semaine)) continue;
-        for (const cell of row) {
-          const s = String(cell || "");
-          if (/^\d{16,20}$/.test(s)) keep.add(s);
-        }
-      }
-
-      let deleted = 0, fetched = 0, lastId = null;
-
-      while (fetched < scan) {
-        const batch = await channel.messages.fetch({
-          limit: Math.min(100, scan - fetched),
-          ...(lastId ? { before: lastId } : {}),
-        });
-        if (!batch.size) break;
-
-        for (const msg of batch.values()) {
-          fetched++;
-          lastId = msg.id;
-
-          if (msg.author?.id !== client.user.id) continue;
-          if (keep.has(msg.id)) continue;
-
-          const embedsText = (msg.embeds || [])
-            .map((e) => `${e.title || ""} ${e.description || ""} ${e.footer?.text || ""}`)
-            .join(" ");
-
-          if (embedsText.includes(semaine)) {
-            try { await msg.delete(); deleted++; } catch {}
-          }
-        }
-      }
-
-      logEvent("info", "salaires", "purge", `week=${semaine} deleted=${deleted} scanned=${fetched}`, {
-        week: semaine,
+      await logEvent("info", "salaires", cmd, `${semaine} -> ${cmd.toUpperCase()} (${changed} lignes)`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        week: semaine,
       });
 
-      return interaction.editReply(`🧹 Purge salaires terminée (scan ${fetched}) → supprimés: **${deleted}** (semaine ${semaine}).`);
+      return interaction.editReply(
+        cmd === "lock"
+          ? `✅ Semaine **${semaine}** verrouillée (${changed} lignes).`
+          : `✅ Semaine **${semaine}** déverrouillée (${changed} lignes).`
+      );
     }
 
-    // ===================== SALAIRES PAY / UNPAY =====================
+    // ---------- PAY / UNPAY ----------
     if (cmd === "pay" || cmd === "unpay") {
       await interaction.deferReply({ ephemeral: true });
-
       const semaine = interaction.options.getString("semaine");
       const employe = interaction.options.getString("employe");
       const newStatus = cmd === "pay" ? "Payé" : "Pas payé";
 
       if (await isWeekLocked(sheets, semaine)) {
-        logEvent("warn", "salaires", cmd, `Refusé (week lock) week=${semaine} employe=${employe}`, {
-          week: semaine,
-          actorTag: interaction.user?.tag,
-          actorId: interaction.user?.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          target: employe,
-        });
         return interaction.editReply(`⛔ La semaine **${semaine}** est verrouillée.`);
       }
 
       const ok = await updateSalaireStatus(sheets, semaine, employe, newStatus);
-      if (!ok) {
-        logEvent("warn", "salaires", cmd, `Employé introuvable week=${semaine} employe=${employe}`, {
-          week: semaine,
-          actorTag: interaction.user?.tag,
-          actorId: interaction.user?.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          target: employe,
-        });
-        return interaction.editReply(`❌ Employé introuvable pour **${semaine}** : "${employe}"`);
-      }
+      if (!ok) return interaction.editReply(`❌ Employé introuvable pour **${semaine}** : "${employe}"`);
 
-      logEvent("info", "salaires", cmd, `${employe} => ${newStatus}`, {
-        week: semaine,
+      await logEvent("info", "salaires", cmd, `${employe} => ${newStatus}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        week: semaine,
         target: employe,
       });
 
+      // (la sync auto ou /syncsalaires mettra à jour l'embed)
       return interaction.editReply(`✅ **${employe}** → **${newStatus}** (compta mise à jour)`);
     }
 
-    // ===================== SALAIRES PAYUSER / UNPAYUSER =====================
+    // ---------- PAYUSER / UNPAYUSER ----------
     if (cmd === "payuser" || cmd === "unpayuser") {
       await interaction.deferReply({ ephemeral: true });
-
       const semaine = interaction.options.getString("semaine");
       const user = interaction.options.getUser("user");
       const newStatus = cmd === "payuser" ? "Payé" : "Pas payé";
 
       if (await isWeekLocked(sheets, semaine)) {
-        logEvent("warn", "salaires", cmd, `Refusé (week lock) week=${semaine} user=${user.id}`, {
-          week: semaine,
-          actorTag: interaction.user?.tag,
-          actorId: interaction.user?.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          target: `<@${user.id}>`,
-        });
         return interaction.editReply(`⛔ La semaine **${semaine}** est verrouillée.`);
       }
 
       const employeName = await getEmployeNameByDiscordId(sheets, user.id);
-      if (!employeName) {
-        logEvent("warn", "salaires", cmd, `Aucun BOT_LINKS actif pour user=${user.id}`, {
-          week: semaine,
-          actorTag: interaction.user?.tag,
-          actorId: interaction.user?.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          target: `<@${user.id}>`,
-        });
-        return interaction.editReply(`❌ Aucun lien actif BOT_LINKS pour <@${user.id}>. Fais d’abord \`/link\`.`);
-      }
+      if (!employeName) return interaction.editReply(`❌ Aucun lien actif BOT_LINKS pour <@${user.id}>. Fais d’abord \`/link\`.`);
 
       const ok = await updateSalaireStatus(sheets, semaine, employeName, newStatus);
-      if (!ok) {
-        logEvent("warn", "salaires", cmd, `Employé introuvable en feuille: ${employeName}`, {
-          week: semaine,
-          actorTag: interaction.user?.tag,
-          actorId: interaction.user?.id,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
-          target: employeName,
-        });
-        return interaction.editReply(`❌ Employé introuvable dans Historique salaires: "${employeName}"`);
-      }
+      if (!ok) return interaction.editReply(`❌ Employé introuvable dans Historique salaires: "${employeName}"`);
 
-      logEvent("info", "salaires", cmd, `<@${user.id}> (${employeName}) => ${newStatus}`, {
-        week: semaine,
+      await logEvent("info", "salaires", cmd, `<@${user.id}> (${employeName}) => ${newStatus}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        week: semaine,
         target: `<@${user.id}> | ${employeName}`,
       });
 
       return interaction.editReply(`✅ <@${user.id}> (**${employeName}**) → **${newStatus}** (compta mise à jour)`);
     }
 
-    // ===================== COMMANDES =====================
-    if (cmd === "commandesstatus") {
+    // ---------- SYNC SALAIRES ----------
+    if (cmd === "syncsalaires") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
-      const count = await countHistoryWeek(COMMANDES_SHEET, semaine);
 
-      logEvent("info", "commandes", "status", `week=${semaine} count=${count}`, {
-        week: semaine,
+      const out = await syncSalairesWeek(semaine);
+      if (out.locked) return interaction.editReply(`⛔ Semaine **${semaine}** verrouillée.`);
+
+      await logEvent("info", "salaires", "sync", `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
         actorTag: interaction.user?.tag,
         actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        week: semaine,
       });
 
-      return interaction.editReply(`📦 **Commandes — ${semaine}**\n🧾 Nombre de lignes: **${count}**`);
+      return interaction.editReply(`✅ Salaires **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
     }
 
-    if (cmd === "synccommandes" || cmd === "publishcommandes") {
+    // ---------- SYNC COMMANDES ----------
+    if (cmd === "synccommandes") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
 
-      const out = await syncHistory({
-        sheetName: COMMANDES_SHEET,
-        stateSheet: BOT_STATE_COMMANDES,
+      const out = await syncHistoryWeek({
+        weekKey: semaine,
+        sheetName: SHEET_COMMANDES,
+        stateSheet: SHEET_BOT_STATE_COMMANDES,
         channelId: COMMANDES_CHANNEL_ID,
+        kind: "Commandes",
+        icon: "📦",
+      });
+
+      await logEvent("info", "commandes", "sync", `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
+        actorTag: interaction.user?.tag,
+        actorId: interaction.user?.id,
+        week: semaine,
+      });
+
+      return interaction.editReply(`✅ Commandes **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
+    }
+
+    // ---------- SYNC RACHAT EMPLOYÉ ----------
+    if (cmd === "syncrachatemploye") {
+      await interaction.deferReply({ ephemeral: true });
+      const semaine = interaction.options.getString("semaine");
+
+      const out = await syncHistoryWeek({
         weekKey: semaine,
-        historyLabel: "Commande",
-        flavor: { kind: "commandes", icon: "📦", title: "Commande" },
-      });
-
-      logEvent("info", "commandes", cmd, `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`✅ Commandes **${semaine}** → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
-    }
-
-    if (cmd === "synccommandesall") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const out = await syncHistory({
-        sheetName: COMMANDES_SHEET,
-        stateSheet: BOT_STATE_COMMANDES,
-        channelId: COMMANDES_CHANNEL_ID,
-        weekKey: null,
-        historyLabel: "Commande",
-        flavor: { kind: "commandes", icon: "📦", title: "Commande" },
-      });
-
-      logEvent("info", "commandes", "syncall", `created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`✅ Commandes (toutes semaines) → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
-    }
-
-    if (cmd === "purgecommandes") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const semaine = interaction.options.getString("semaine");
-      const scan = interaction.options.getInteger("scan") ?? 300;
-
-      const out = await purgeHistory({
-        stateSheet: BOT_STATE_COMMANDES,
-        channelId: COMMANDES_CHANNEL_ID,
-        weekKey: semaine,
-        scan,
-        historyLabel: "Commandes",
-      });
-
-      logEvent("info", "commandes", "purge", `week=${semaine} deleted=${out.deleted} scanned=${out.scanned}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`🧹 Purge commandes **${semaine}** → supprimés: **${out.deleted}** (scan ${out.scanned})`);
-    }
-
-    // ===================== RACHAT EMPLOYÉ =====================
-    if (cmd === "rachatemployestatus") {
-      await interaction.deferReply({ ephemeral: true });
-      const semaine = interaction.options.getString("semaine");
-      const count = await countHistoryWeek(RACHAT_EMPLOYE_SHEET, semaine);
-
-      logEvent("info", "rachat_employe", "status", `week=${semaine} count=${count}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`👤 **Rachat employé — ${semaine}**\n🧾 Nombre de lignes: **${count}**`);
-    }
-
-    if (cmd === "syncrachatemploye" || cmd === "publishrachatemploye") {
-      await interaction.deferReply({ ephemeral: true });
-      const semaine = interaction.options.getString("semaine");
-
-      const out = await syncHistory({
-        sheetName: RACHAT_EMPLOYE_SHEET,
-        stateSheet: BOT_STATE_RACHAT_EMPLOYE,
+        sheetName: SHEET_RACHAT_EMPLOYE,
+        stateSheet: SHEET_BOT_STATE_RACHAT_EMPLOYE,
         channelId: RACHAT_EMPLOYE_CHANNEL_ID,
+        kind: "Rachat employé",
+        icon: "👤",
+      });
+
+      await logEvent("info", "rachat_employe", "sync", `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
+        actorTag: interaction.user?.tag,
+        actorId: interaction.user?.id,
+        week: semaine,
+      });
+
+      return interaction.editReply(`✅ Rachat employé **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
+    }
+
+    // ---------- SYNC RACHAT TEMP ----------
+    if (cmd === "syncrachattemp") {
+      await interaction.deferReply({ ephemeral: true });
+      const semaine = interaction.options.getString("semaine");
+
+      const out = await syncHistoryWeek({
         weekKey: semaine,
-        historyLabel: "Rachat employé",
-        flavor: { kind: "rachat_employe", icon: "👤", title: "Rachat employé" },
-      });
-
-      logEvent("info", "rachat_employe", cmd, `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`✅ Rachat employé **${semaine}** → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
-    }
-
-    if (cmd === "syncrachatemployeall") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const out = await syncHistory({
-        sheetName: RACHAT_EMPLOYE_SHEET,
-        stateSheet: BOT_STATE_RACHAT_EMPLOYE,
-        channelId: RACHAT_EMPLOYE_CHANNEL_ID,
-        weekKey: null,
-        historyLabel: "Rachat employé",
-        flavor: { kind: "rachat_employe", icon: "👤", title: "Rachat employé" },
-      });
-
-      logEvent("info", "rachat_employe", "syncall", `created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`✅ Rachat employé (toutes semaines) → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
-    }
-
-    if (cmd === "purgerachatemploye") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const semaine = interaction.options.getString("semaine");
-      const scan = interaction.options.getInteger("scan") ?? 300;
-
-      const out = await purgeHistory({
-        stateSheet: BOT_STATE_RACHAT_EMPLOYE,
-        channelId: RACHAT_EMPLOYE_CHANNEL_ID,
-        weekKey: semaine,
-        scan,
-        historyLabel: "Rachat employé",
-      });
-
-      logEvent("info", "rachat_employe", "purge", `week=${semaine} deleted=${out.deleted} scanned=${out.scanned}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`🧹 Purge rachat employé **${semaine}** → supprimés: **${out.deleted}** (scan ${out.scanned})`);
-    }
-
-    // ===================== RACHAT TEMPORAIRE =====================
-    if (cmd === "rachattempstatus") {
-      await interaction.deferReply({ ephemeral: true });
-      const semaine = interaction.options.getString("semaine");
-      const count = await countHistoryWeek(RACHAT_TEMPORAIRE_SHEET, semaine);
-
-      logEvent("info", "rachat_temporaire", "status", `week=${semaine} count=${count}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`⏳ **Rachat temporaire — ${semaine}**\n🧾 Nombre de lignes: **${count}**`);
-    }
-
-    if (cmd === "syncrachattemp" || cmd === "publishrachattemp") {
-      await interaction.deferReply({ ephemeral: true });
-      const semaine = interaction.options.getString("semaine");
-
-      const out = await syncHistory({
-        sheetName: RACHAT_TEMPORAIRE_SHEET,
-        stateSheet: BOT_STATE_RACHAT_TEMPORAIRE,
+        sheetName: SHEET_RACHAT_TEMP,
+        stateSheet: SHEET_BOT_STATE_RACHAT_TEMP,
         channelId: RACHAT_TEMPORAIRE_CHANNEL_ID,
-        weekKey: semaine,
-        historyLabel: "Rachat temporaire",
-        flavor: { kind: "rachat_temp", icon: "⏳", title: "Rachat temporaire" },
+        kind: "Rachat temporaire",
+        icon: "⏳",
       });
 
-      logEvent("info", "rachat_temporaire", cmd, `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
+      await logEvent("info", "rachat_temp", "sync", `week=${semaine} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
+        actorTag: interaction.user?.tag,
+        actorId: interaction.user?.id,
         week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
       });
 
-      return interaction.editReply(`✅ Rachat temporaire **${semaine}** → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
+      return interaction.editReply(`✅ Rachat temporaire **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
     }
 
-    if (cmd === "syncrachattempall") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const out = await syncHistory({
-        sheetName: RACHAT_TEMPORAIRE_SHEET,
-        stateSheet: BOT_STATE_RACHAT_TEMPORAIRE,
-        channelId: RACHAT_TEMPORAIRE_CHANNEL_ID,
-        weekKey: null,
-        historyLabel: "Rachat temporaire",
-        flavor: { kind: "rachat_temp", icon: "⏳", title: "Rachat temporaire" },
-      });
-
-      logEvent("info", "rachat_temporaire", "syncall", `created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`✅ Rachat temporaire (toutes semaines) → created: ${out.created}, edited: ${out.edited}, skipped: ${out.skipped}`);
-    }
-
-    if (cmd === "purgerachattemp") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const semaine = interaction.options.getString("semaine");
-      const scan = interaction.options.getInteger("scan") ?? 300;
-
-      const out = await purgeHistory({
-        stateSheet: BOT_STATE_RACHAT_TEMPORAIRE,
-        channelId: RACHAT_TEMPORAIRE_CHANNEL_ID,
-        weekKey: semaine,
-        scan,
-        historyLabel: "Rachat temporaire",
-      });
-
-      logEvent("info", "rachat_temporaire", "purge", `week=${semaine} deleted=${out.deleted} scanned=${out.scanned}`, {
-        week: semaine,
-        actorTag: interaction.user?.tag,
-        actorId: interaction.user?.id,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
-
-      return interaction.editReply(`🧹 Purge rachat temporaire **${semaine}** → supprimés: **${out.deleted}** (scan ${out.scanned})`);
-    }
-
-    // fallback
     return interaction.reply({ content: "❓ Commande non gérée côté bot.js.", ephemeral: true });
   } catch (e) {
-    console.error(e);
-
-    // ✅ LOG ERREUR (le fameux bloc)
-    const cmdSafe = interaction?.commandName || "unknown";
-    logEvent("error", "command", `/${cmdSafe}`, String(e?.stack || e || ""), {
+    await logEvent("error", "command", `/${cmd}`, String(e?.stack || e || ""), {
       actorTag: interaction.user?.tag,
       actorId: interaction.user?.id,
       guildId: interaction.guildId,
@@ -1914,56 +1299,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ===================== REACTIONS ✅/❌ (SALAIRES) =====================
-client.on(Events.MessageReactionAdd, async (reaction, user) => {
-  try {
-    if (user.bot) return;
+// ===================== PROCESS SAFETY =====================
+process.on("unhandledRejection", async (err) => {
+  await logEvent("error", "process", "unhandledRejection", String(err?.stack || err || ""));
+});
 
-    if (reaction.partial) await reaction.fetch().catch(() => {});
-    if (reaction.message?.partial) await reaction.message.fetch().catch(() => {});
+process.on("uncaughtException", async (err) => {
+  await logEvent("error", "process", "uncaughtException", String(err?.stack || err || ""));
+  // sur un hébergeur, mieux de laisser redémarrer proprement
+  process.exit(1);
+});
 
-    if (!SALAIRES_CHANNEL_ID) return;
-    if (reaction.message.channelId !== SALAIRES_CHANNEL_ID) return;
+// ===================== READY =====================
+client.once(Events.ClientReady, async () => {
+  // debug env (utile Koyeb)
+  console.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
+  console.log("[AUTO] AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
+  console.log("[AUTO] AUTO_SYNC_WEEKS_BACK =", process.env.AUTO_SYNC_WEEKS_BACK);
+  console.log("[AUTO] AUTO_SYNC_ON_START =", process.env.AUTO_SYNC_ON_START);
 
-    const emoji = reaction.emoji?.name;
-    if (emoji !== "✅" && emoji !== "❌") return;
+  await logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`);
 
-    // uniquement message du bot
-    if (reaction.message.author?.id !== client.user.id) return;
+  // ===== AUTO-SYNC SCHEDULER =====
+  if (AUTO_SYNC) {
+    await logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
 
-    const guild = reaction.message.guild;
-    if (!guild) return;
-
-    const member = await guild.members.fetch(user.id).catch(() => null);
-    if (!member || !hasPayRole(member)) {
-      await user.send("⛔ Tu n’as pas la permission d’utiliser ✅/❌ sur les salaires.").catch(() => {});
-      try { await reaction.users.remove(user.id); } catch {}
-      return;
+    if (AUTO_SYNC_ON_START) {
+      runAutoSyncOnce().catch(() => {});
     }
 
-    const sheets = await getSheets();
-    const state = await findStateByMessageId(sheets, reaction.message.id);
-    if (!state?.weekKey || !state?.employeName) return;
-
-    if (state.locked || (await isWeekLocked(sheets, state.weekKey))) {
-      await user.send(`⛔ Semaine **${state.weekKey}** verrouillée. Impossible de modifier.`).catch(() => {});
-      try { await reaction.users.remove(user.id); } catch {}
-      return;
-    }
-
-    const newStatus = emoji === "✅" ? "Payé" : "Pas payé";
-    const ok = await updateSalaireStatus(sheets, state.weekKey, state.employeName, newStatus);
-
-    if (!ok) {
-      await user.send(`❌ Impossible de trouver **${state.employeName}** en **${state.weekKey}** dans la compta.`).catch(() => {});
-      try { await reaction.users.remove(user.id); } catch {}
-      return;
-    }
-
-    try { await reaction.users.remove(user.id); } catch {}
-    await user.send(`✅ Modifié: **${state.employeName}** (${state.weekKey}) → **${newStatus}**`).catch(() => {});
-  } catch (e) {
-    console.error("Reaction handler error:", e);
+    setInterval(() => {
+      runAutoSyncOnce().catch(() => {});
+    }, AUTO_SYNC_INTERVAL_SECONDS * 1000);
   }
 });
 
