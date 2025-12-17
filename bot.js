@@ -1,4 +1,4 @@
-/* bot.js — LGW Menuiserie Bot (4 historiques + autosync + hosting)
+/* bot.js — LGW Menuiserie Bot (4 historiques + réactions ✅/❌ + hosting)
  * Node: CommonJS
  * Dépendances: discord.js, dotenv, googleapis, express
  */
@@ -38,10 +38,10 @@ const RACHAT_TEMPORAIRE_CHANNEL_ID = process.env.RACHAT_TEMPORAIRE_CHANNEL_ID ||
 
 // Google key file
 const GOOGLE_KEYFILE = process.env.GOOGLE_KEYFILE || "service-account.json";
-// Optionnel: si tu veux passer le JSON en base64 en env
+// Optionnel: JSON base64 en env
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 
-// Permissions (2 rôles autorisés, IDs séparés par virgule)
+// Permissions (IDs de rôles autorisés, séparés par virgule)
 const PAY_ROLE_IDS = (process.env.PAY_ROLE_IDS || "")
   .split(",")
   .map((s) => s.trim())
@@ -68,7 +68,7 @@ const SHEET_COMMANDES = "Historique commandes";
 const SHEET_RACHAT_EMPLOYE = "Historique rachat employé";
 const SHEET_RACHAT_TEMP = "Historique rachat temporaire";
 
-const SHEET_BOT_STATE_SALAIRES = "BOT_STATE"; // salaires (lock semaine)
+const SHEET_BOT_STATE_SALAIRES = "BOT_STATE";
 const SHEET_BOT_STATE_COMMANDES = "BOT_STATE_COMMANDES";
 const SHEET_BOT_STATE_RACHAT_EMPLOYE = "BOT_STATE_RACHAT_EMPLOYE";
 const SHEET_BOT_STATE_RACHAT_TEMP = "BOT_STATE_RACHAT_TEMP";
@@ -117,11 +117,10 @@ function sortWeeksDesc(weeks) {
 
 function filterChoices(values, typed) {
   const t = String(typed || "").toLowerCase();
-  const out = values
+  return values
     .filter((v) => String(v).toLowerCase().includes(t))
     .slice(0, 25)
     .map((v) => ({ name: String(v).slice(0, 100), value: String(v).slice(0, 100) }));
-  return out;
 }
 
 function safeMoney(v) {
@@ -132,57 +131,15 @@ function safeMoney(v) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ===================== LOGGING =====================
-let _logsChannelCache = null;
-
-async function resolveLogsChannel() {
-  if (!LOGS_CHANNEL_ID) return null;
-  if (_logsChannelCache) return _logsChannelCache;
+async function dmUserSafe(user, content) {
   try {
-    const ch = await client.channels.fetch(LOGS_CHANNEL_ID);
-    if (ch && ch.isTextBased?.()) {
-      _logsChannelCache = ch;
-      return ch;
-    }
-  } catch {}
-  return null;
-}
-
-function nowStr() {
-  const d = new Date();
-  return d.toISOString().replace("T", " ").replace("Z", "");
-}
-
-async function logEvent(level, source, action, message, meta = {}) {
-  const line = `[${level.toUpperCase()}] ${source} • ${action} ${message}`;
-  console.log(line);
-
-  const ch = await resolveLogsChannel();
-  if (!ch) return;
-
-  const parts = [];
-  parts.push(`**${level.toUpperCase()}** • **${action}**`);
-  parts.push(`${message}`);
-
-  const metaLines = [];
-  for (const [k, v] of Object.entries(meta || {})) {
-    if (v === undefined || v === null || String(v).trim() === "") continue;
-    metaLines.push(`**${k}**: ${String(v).slice(0, 500)}`);
+    await user.send(content);
+  } catch {
+    // DM fermés => on ignore
   }
-
-  const embed = new EmbedBuilder()
-    .setTitle(`${source}`)
-    .setDescription(parts.join("\n"))
-    .addFields(metaLines.slice(0, 20).map((t) => ({ name: "\u200b", value: t })))
-    .setFooter({ text: nowStr() })
-    .setTimestamp(new Date());
-
-  try {
-    await ch.send({ embeds: [embed] });
-  } catch {}
 }
 
-// ===================== GOOGLE: prepare keyfile if base64 env exists =====================
+// ===================== GOOGLE: keyfile from base64 env =====================
 function ensureKeyfileFromB64() {
   if (!GOOGLE_SERVICE_ACCOUNT_JSON_B64) return;
   try {
@@ -213,7 +170,7 @@ async function sheetTitles(sheets) {
   return (meta.data.sheets || []).map((s) => s.properties?.title).filter(Boolean);
 }
 
-async function ensureSheet(sheets, title, headerRow /* array */) {
+async function ensureSheet(sheets, title, headerRow) {
   const titles = await sheetTitles(sheets);
   if (titles.includes(title)) return;
 
@@ -250,7 +207,6 @@ async function updateCell(sheets, rangeA1, value) {
   });
 }
 
-// ===================== PARSE HISTORY (generic) =====================
 async function readSheetTable(sheets, sheetName, maxRows = 5000) {
   return await readRange(sheets, `${sheetName}!A1:Z${maxRows}`);
 }
@@ -294,11 +250,93 @@ function parseHistory(table) {
   return { header, records };
 }
 
+// ===================== DISCORD CLIENT =====================
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions, // ✅ réactions
+  ],
+  partials: [
+    Partials.Channel,
+    Partials.Message,
+    Partials.Reaction,
+    Partials.User,
+  ],
+});
+
+// ===================== LOGGING =====================
+let _logsChannelCache = null;
+
+async function resolveLogsChannel() {
+  if (!LOGS_CHANNEL_ID) return null;
+  if (_logsChannelCache) return _logsChannelCache;
+  try {
+    const ch = await client.channels.fetch(LOGS_CHANNEL_ID);
+    if (ch && ch.isTextBased?.()) {
+      _logsChannelCache = ch;
+      return ch;
+    }
+  } catch {}
+  return null;
+}
+
+function nowStr() {
+  const d = new Date();
+  return d.toISOString().replace("T", " ").replace("Z", "");
+}
+
+async function logEvent(level, source, action, message, meta = {}) {
+  const line = `[${level.toUpperCase()}] ${source} • ${action} ${message}`;
+  console.log(line);
+
+  const ch = await resolveLogsChannel();
+  if (!ch) return;
+
+  const metaLines = [];
+  for (const [k, v] of Object.entries(meta || {})) {
+    if (v === undefined || v === null || String(v).trim() === "") continue;
+    metaLines.push(`**${k}**: ${String(v).slice(0, 500)}`);
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${source}`)
+    .setDescription(`**${level.toUpperCase()}** • **${action}**\n${message}`)
+    .addFields(metaLines.slice(0, 20).map((t) => ({ name: "\u200b", value: t })))
+    .setFooter({ text: nowStr() })
+    .setTimestamp(new Date());
+
+  try {
+    await ch.send({ embeds: [embed] });
+  } catch {}
+}
+
+async function resolveTextChannel(channelId) {
+  if (!channelId) return null;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    if (ch && ch.isTextBased?.()) return ch;
+  } catch {}
+  return null;
+}
+
+function hasPayRole(member) {
+  try {
+    if (!member) return false;
+    if (member.permissions?.has?.("Administrator")) return true;
+    if (!PAY_ROLE_IDS.length) return true; // pas configuré => autorise
+    const roles = member.roles?.cache;
+    if (!roles) return false;
+    return PAY_ROLE_IDS.some((id) => roles.has(id));
+  } catch {
+    return false;
+  }
+}
+
 // ===================== LINKS (BOT_LINKS) =====================
 let _linksCache = { ts: 0, map: new Map() };
 
 async function readLinks(sheets) {
-  // BOT_LINKS: telegramme | employeName | discordUserId | active | updatedAt
   await ensureSheet(sheets, SHEET_BOT_LINKS, ["telegramme", "employeName", "discordUserId", "active", "updatedAt"]);
   return await readRange(sheets, `${SHEET_BOT_LINKS}!A1:E2000`);
 }
@@ -317,7 +355,6 @@ async function getLinksMapCached(sheets) {
     const active = String(r[3] || "").toLowerCase() === "true";
     if (!active) continue;
     if (!employeName || !discordUserId) continue;
-
     map.set(normName(employeName), String(discordUserId));
   }
 
@@ -329,7 +366,6 @@ async function upsertLink(sheets, { telegramme, employeName, discordUserId, acti
   const rows = await readLinks(sheets);
   const now = new Date().toISOString();
 
-  // match by discordUserId
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
     if (String(r[2] || "") === String(discordUserId)) {
@@ -345,7 +381,6 @@ async function upsertLink(sheets, { telegramme, employeName, discordUserId, acti
     }
   }
 
-  // append
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_BOT_LINKS}!A1`,
@@ -374,10 +409,7 @@ async function deactivateLink(sheets, discordUserId) {
 }
 
 async function deleteLinkRow(sheets, discordUserId) {
-  // suppression “ligne” via batchUpdate (deleteDimension)
   const rows = await readLinks(sheets);
-
-  // besoin sheetId
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const sheet = (meta.data.sheets || []).find((s) => s.properties?.title === SHEET_BOT_LINKS);
   if (!sheet) return { action: "no_sheet" };
@@ -386,7 +418,7 @@ async function deleteLinkRow(sheets, discordUserId) {
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
     if (String(r[2] || "") === String(discordUserId)) {
-      const startIndex = i; // 0-based, skip header => i is correct
+      const startIndex = i;
       await sheets.spreadsheets.batchUpdate({
         spreadsheetId: SPREADSHEET_ID,
         requestBody: {
@@ -436,46 +468,15 @@ async function ensureStateSheetSalaires(sheets) {
 
 async function readStateRows(sheets, sheetTitle, max = 5000) {
   await ensureStateSheet(sheets, sheetTitle);
-  const rows = await readRange(sheets, `${sheetTitle}!A1:G${max}`);
-  return rows;
+  return await readRange(sheets, `${sheetTitle}!A1:G${max}`);
 }
 
 async function readStateRowsSalaires(sheets, max = 5000) {
   await ensureStateSheetSalaires(sheets);
-  const rows = await readRange(sheets, `${SHEET_BOT_STATE_SALAIRES}!A1:I${max}`);
-  return rows;
+  return await readRange(sheets, `${SHEET_BOT_STATE_SALAIRES}!A1:I${max}`);
 }
 
-// ===================== DISCORD CLIENT =====================
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-  partials: [Partials.Channel],
-});
-
-async function resolveTextChannel(channelId) {
-  if (!channelId) return null;
-  try {
-    const ch = await client.channels.fetch(channelId);
-    if (ch && ch.isTextBased?.()) return ch;
-  } catch {}
-  return null;
-}
-
-function hasPayRole(member) {
-  // allow admins/guild owner too
-  try {
-    if (!member) return false;
-    if (member.permissions?.has?.("Administrator")) return true;
-    if (!PAY_ROLE_IDS.length) return true; // si tu n'as pas configuré PAY_ROLE_IDS -> autorise
-    const roles = member.roles?.cache;
-    if (!roles) return false;
-    return PAY_ROLE_IDS.some((id) => roles.has(id));
-  } catch {
-    return false;
-  }
-}
-
-// ===================== SALAIRES: status / lock / update =====================
+// ===================== SALAIRES: lock / status / update =====================
 async function isWeekLocked(sheets, weekKey) {
   const rows = await readStateRowsSalaires(sheets);
   for (let i = 1; i < rows.length; i++) {
@@ -489,18 +490,21 @@ async function isWeekLocked(sheets, weekKey) {
 async function lockWeek(sheets, weekKey, lockValue) {
   const rows = await readStateRowsSalaires(sheets);
   let changed = 0;
+
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
     if (String(r[1] || "") !== String(weekKey)) continue;
     r[7] = lockValue ? "true" : "";
     changed++;
   }
+
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_BOT_STATE_SALAIRES}!A1:I${rows.length}`,
     valueInputOption: "RAW",
     requestBody: { values: rows },
   });
+
   return changed;
 }
 
@@ -522,7 +526,10 @@ async function computeSalairesStatus(sheets, weekKey) {
     if (!name) continue;
 
     count++;
-    const statut = idxStatut !== -1 ? String(r.obj[header[idxStatut]] || "") : String(r.obj["Statut au moment de la clôture"] || "");
+    const statut = idxStatut !== -1
+      ? String(r.obj[header[idxStatut]] || "")
+      : String(r.obj["Statut au moment de la clôture"] || "");
+
     if (statut.toLowerCase().includes("pay")) paid++;
     else unpaid++;
 
@@ -550,7 +557,7 @@ async function updateSalaireStatus(sheets, weekKey, employeName, newStatus) {
     const n = String(r.obj[header[idxName]] || "").trim();
     if (normName(n) !== normName(employeName)) continue;
 
-    const colLetter = String.fromCharCode(65 + idxStatut); // A=0
+    const colLetter = String.fromCharCode(65 + idxStatut);
     const range = `${SHEET_SALAIRES}!${colLetter}${r.rowIndex}`;
     await updateCell(sheets, range, newStatus);
     return true;
@@ -566,7 +573,7 @@ function buildSalaireEmbed(weekKey, obj) {
   const tel = String(obj["Télégramme"] || "");
   const statut = String(obj["Statut au moment de la clôture"] || "");
 
-  const embed = new EmbedBuilder()
+  return new EmbedBuilder()
     .setTitle(`${grade ? `${grade} — ` : ""}${name}`)
     .setDescription(
       `📌 Semaine: **${weekKey}**\n` +
@@ -581,23 +588,12 @@ function buildSalaireEmbed(weekKey, obj) {
       { name: "Montant rachat", value: safeMoney(obj["Montant rachat"]), inline: true },
       { name: "Total payé", value: safeMoney(obj["Total payé"]), inline: true },
     )
-    .setFooter({ text: `LGW • Salaires • ${weekKey}` })
+    .setFooter({ text: `Salaires • ${weekKey}` })
     .setTimestamp(new Date());
-
-  return embed;
 }
 
 function guessTitle(obj, fallback) {
-  const candidates = [
-    "Prénom et nom",
-    "Client",
-    "Nom du client",
-    "Nom",
-    "Employé",
-    "Produit",
-    "Libellé",
-    "Référence",
-  ];
+  const candidates = ["Prénom et nom", "Client", "Nom du client", "Nom", "Employé", "Produit", "Libellé", "Référence"];
   for (const k of candidates) {
     const v = obj[k];
     if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
@@ -610,10 +606,9 @@ function buildGenericEmbed(kind, icon, weekKey, obj) {
   const embed = new EmbedBuilder()
     .setTitle(`${icon} ${title}`)
     .setDescription(`📌 Semaine: **${weekKey}**`)
-    .setFooter({ text: `LGW • ${kind} • ${weekKey}` })
+    .setFooter({ text: `${kind} • ${weekKey}` })
     .setTimestamp(new Date());
 
-  // Ajoute des champs (max 20)
   const fields = [];
   const entries = Object.entries(obj || {});
   for (const [k, v] of entries) {
@@ -623,18 +618,17 @@ function buildGenericEmbed(kind, icon, weekKey, obj) {
     fields.push({ name: String(k).slice(0, 256), value: val.slice(0, 1024), inline: true });
     if (fields.length >= 18) break;
   }
-
   if (fields.length) embed.addFields(fields);
+
   return embed;
 }
 
-// ===================== SYNC: SALAIRES (BOT_STATE) =====================
+// ===================== SYNC: SALAIRES =====================
 async function syncSalairesWeek(weekKey) {
   const sheets = await getSheets();
   await ensureStateSheetSalaires(sheets);
 
   if (!SALAIRES_CHANNEL_ID) throw new Error("SALAIRES_CHANNEL_ID manquant (env).");
-
   if (await isWeekLocked(sheets, weekKey)) {
     return { locked: true, created: 0, edited: 0, skipped: 0 };
   }
@@ -655,7 +649,6 @@ async function syncSalairesWeek(weekKey) {
   const header = stateRows[0] || [];
   const data = stateRows.slice(1);
 
-  // map key -> { idx, row }
   const map = new Map();
   for (let i = 0; i < data.length; i++) {
     const row = data[i] || [];
@@ -669,10 +662,7 @@ async function syncSalairesWeek(weekKey) {
     const employeName = String(rec.obj["Prénom et nom"] || "").trim();
     const key = `${weekKey}::${normName(employeName)}`;
 
-    const newHash = sha({
-      week: weekKey,
-      obj: rec.obj,
-    });
+    const newHash = sha({ week: weekKey, obj: rec.obj });
 
     const st = map.get(key);
     const oldMsgId = st?.row?.[6] ? String(st.row[6]) : "";
@@ -693,14 +683,14 @@ async function syncSalairesWeek(weekKey) {
     const mention = discordUserId ? `<@${discordUserId}>` : "";
     const embed = buildSalaireEmbed(weekKey, rec.obj);
 
-    // edit si possible
+    // EDIT (pas de ping)
     if (oldMsgId) {
       try {
         const msg = await ch.messages.fetch(oldMsgId);
         await msg.edit({
-          content: mention,               // ne reping pas (normal)
+          content: mention,
           embeds: [embed],
-          allowedMentions: { parse: [] }, // évite ping sur edit
+          allowedMentions: { parse: [] },
         });
 
         edited++;
@@ -713,16 +703,16 @@ async function syncSalairesWeek(weekKey) {
         row[4] = String(rec.obj["Télégramme"] || "");
         row[5] = SALAIRES_CHANNEL_ID;
         row[6] = oldMsgId;
-        row[7] = ""; // unlocked
+        row[7] = "";
         row[8] = newHash;
 
         continue;
       } catch {
-        // message supprimé => on crée (et ping)
+        // msg supprimé => create
       }
     }
 
-    // create => ping à la création
+    // CREATE => ping
     const msg = await ch.send({
       content: mention,
       embeds: [embed],
@@ -740,7 +730,7 @@ async function syncSalairesWeek(weekKey) {
       row[4] = String(rec.obj["Télégramme"] || "");
       row[5] = SALAIRES_CHANNEL_ID;
       row[6] = msg.id;
-      row[7] = ""; // unlocked
+      row[7] = "";
       row[8] = newHash;
     } else {
       data.push([
@@ -788,7 +778,6 @@ async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind
   const header = stateRows[0] || [];
   const data = stateRows.slice(1);
 
-  // state columns: key, week, name, channelId, messageId, locked, hash
   const map = new Map();
   for (let i = 0; i < data.length; i++) {
     const row = data[i] || [];
@@ -799,7 +788,6 @@ async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind
   let created = 0, edited = 0, skipped = 0;
 
   for (const rec of weekRecords) {
-    // key = week + rowIndex (stable) + short hash of row
     const key = `${weekKey}::${sheetName}::row${rec.rowIndex}`;
     const newHash = sha({ week: weekKey, obj: rec.obj });
 
@@ -812,7 +800,6 @@ async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind
       skipped++;
       continue;
     }
-
     if (oldMsgId && oldHash === newHash) {
       skipped++;
       continue;
@@ -837,7 +824,7 @@ async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind
 
         continue;
       } catch {
-        // message supprimé => create
+        // msg supprimé => create
       }
     }
 
@@ -881,24 +868,15 @@ async function syncHistoryWeek({ weekKey, sheetName, stateSheet, channelId, kind
 // ===================== AUTOCOMPLETE DATA =====================
 async function getWeeksUnion(sheets) {
   const weeks = [];
-
-  const sheetsToScan = [
-    SHEET_SALAIRES,
-    SHEET_COMMANDES,
-    SHEET_RACHAT_EMPLOYE,
-    SHEET_RACHAT_TEMP,
-  ];
+  const sheetsToScan = [SHEET_SALAIRES, SHEET_COMMANDES, SHEET_RACHAT_EMPLOYE, SHEET_RACHAT_TEMP];
 
   for (const sn of sheetsToScan) {
     try {
       const table = await readSheetTable(sheets, sn, 2000);
       const { records } = parseHistory(table);
       for (const r of records) weeks.push(r.week);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
-
   return sortWeeksDesc(weeks);
 }
 
@@ -925,12 +903,10 @@ async function runAutoSyncOnce() {
     await logEvent("info", "autosync", "run", `Weeks: ${weeks.join(", ")}`);
 
     for (const w of weeks) {
-      // Salaires
       const outSal = await syncSalairesWeek(w);
       await logEvent("info", "autosync", "salaires", `week=${w} created=${outSal.created} edited=${outSal.edited} skipped=${outSal.skipped} locked=${outSal.locked}`, { week: w });
-      await sleep(500);
+      await sleep(400);
 
-      // Commandes
       const outCmd = await syncHistoryWeek({
         weekKey: w,
         sheetName: SHEET_COMMANDES,
@@ -940,9 +916,8 @@ async function runAutoSyncOnce() {
         icon: "📦",
       });
       await logEvent("info", "autosync", "commandes", `week=${w} created=${outCmd.created} edited=${outCmd.edited} skipped=${outCmd.skipped}`, { week: w });
-      await sleep(500);
+      await sleep(400);
 
-      // Rachat employé
       const outRE = await syncHistoryWeek({
         weekKey: w,
         sheetName: SHEET_RACHAT_EMPLOYE,
@@ -952,9 +927,8 @@ async function runAutoSyncOnce() {
         icon: "👤",
       });
       await logEvent("info", "autosync", "rachat_employe", `week=${w} created=${outRE.created} edited=${outRE.edited} skipped=${outRE.skipped}`, { week: w });
-      await sleep(500);
+      await sleep(400);
 
-      // Rachat temporaire
       const outRT = await syncHistoryWeek({
         weekKey: w,
         sheetName: SHEET_RACHAT_TEMP,
@@ -965,7 +939,7 @@ async function runAutoSyncOnce() {
       });
       await logEvent("info", "autosync", "rachat_temp", `week=${w} created=${outRT.created} edited=${outRT.edited} skipped=${outRT.skipped}`, { week: w });
 
-      await sleep(800);
+      await sleep(600);
     }
   } catch (e) {
     await logEvent("error", "autosync", "run_error", String(e?.stack || e || ""));
@@ -989,9 +963,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (tooLate()) return;
       const weeks = await getWeeksUnion(sheets);
       if (tooLate()) return;
-
       await interaction.respond(filterChoices(weeks, focused.value)).catch((err) => {
-        if (err?.code === 10062) return; // Unknown interaction (expired)
+        if (err?.code === 10062) return; // expired
       });
       return;
     }
@@ -1023,12 +996,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const cmd = interaction.commandName;
 
   try {
-    // permissions (tout ce qui touche la compta)
     const protectedCommands = new Set([
       "syncsalaires", "salairesstatus", "lock", "unlock", "pay", "unpay", "payuser", "unpayuser",
-      "synccommandes",
-      "syncrachatemploye",
-      "syncrachattemp",
+      "synccommandes", "syncrachatemploye", "syncrachattemp",
       "link", "unlink", "dellink",
     ]);
 
@@ -1044,7 +1014,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const sheets = await getSheets();
 
-    // ---------- LINKS ----------
+    // ----- LINKS -----
     if (cmd === "link") {
       await interaction.deferReply({ ephemeral: true });
       const user = interaction.options.getUser("user");
@@ -1105,7 +1075,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply("⚠️ Impossible (onglet BOT_LINKS introuvable).");
     }
 
-    // ---------- SALAIRES STATUS ----------
+    // ----- SALAIRES STATUS -----
     if (cmd === "salairesstatus") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1126,7 +1096,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    // ---------- LOCK / UNLOCK ----------
+    // ----- LOCK / UNLOCK -----
     if (cmd === "lock" || cmd === "unlock") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1145,7 +1115,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    // ---------- PAY / UNPAY ----------
+    // ----- PAY / UNPAY (par nom) -----
     if (cmd === "pay" || cmd === "unpay") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1166,11 +1136,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         target: employe,
       });
 
-      // (la sync auto ou /syncsalaires mettra à jour l'embed)
-      return interaction.editReply(`✅ **${employe}** → **${newStatus}** (compta mise à jour)`);
+      // refresh embed semaine
+      await syncSalairesWeek(semaine).catch(() => {});
+      return interaction.editReply(`✅ **${employe}** → **${newStatus}** (compta + embed mis à jour)`);
     }
 
-    // ---------- PAYUSER / UNPAYUSER ----------
+    // ----- PAYUSER / UNPAYUSER (par user lié) -----
     if (cmd === "payuser" || cmd === "unpayuser") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1194,10 +1165,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         target: `<@${user.id}> | ${employeName}`,
       });
 
-      return interaction.editReply(`✅ <@${user.id}> (**${employeName}**) → **${newStatus}** (compta mise à jour)`);
+      await syncSalairesWeek(semaine).catch(() => {});
+      return interaction.editReply(`✅ <@${user.id}> (**${employeName}**) → **${newStatus}** (compta + embed mis à jour)`);
     }
 
-    // ---------- SYNC SALAIRES ----------
+    // ----- SYNC SALAIRES -----
     if (cmd === "syncsalaires") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1214,7 +1186,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply(`✅ Salaires **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
     }
 
-    // ---------- SYNC COMMANDES ----------
+    // ----- SYNC COMMANDES -----
     if (cmd === "synccommandes") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1237,7 +1209,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply(`✅ Commandes **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
     }
 
-    // ---------- SYNC RACHAT EMPLOYÉ ----------
+    // ----- SYNC RACHAT EMPLOYÉ -----
     if (cmd === "syncrachatemploye") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1260,7 +1232,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply(`✅ Rachat employé **${semaine}** → created:${out.created} edited:${out.edited} skipped:${out.skipped}`);
     }
 
-    // ---------- SYNC RACHAT TEMP ----------
+    // ----- SYNC RACHAT TEMP -----
     if (cmd === "syncrachattemp") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -1299,6 +1271,126 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// ===================== ✅/❌ REACTIONS SUR SALAIRES =====================
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (user.bot) return;
+
+    // partials
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+
+    const emoji = reaction.emoji?.name;
+    if (emoji !== "✅" && emoji !== "❌") return;
+
+    const msg = reaction.message;
+
+    // uniquement salon salaires
+    if (!SALAIRES_CHANNEL_ID || msg.channelId !== SALAIRES_CHANNEL_ID) return;
+
+    // uniquement messages du bot
+    if (!msg.author || msg.author.id !== client.user.id) return;
+
+    const guild = msg.guild;
+    if (!guild) return;
+
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (!hasPayRole(member)) {
+      await reaction.users.remove(user.id).catch(() => {});
+      await dmUserSafe(user, "⛔ Tu n’as pas la permission d’utiliser ✅/❌ sur les salaires.");
+      await logEvent("warn", "reaction", "denied", `emoji=${emoji}`, {
+        actorTag: user.tag,
+        actorId: user.id,
+        guildId: guild.id,
+        channelId: msg.channelId,
+      });
+      return;
+    }
+
+    const sheets = await getSheets();
+
+    // retrouver semaine + employé via BOT_STATE (messageId)
+    const stateRows = await readStateRowsSalaires(sheets);
+    const data = stateRows.slice(1);
+
+    let weekKey = null;
+    let employeName = null;
+
+    for (const row of data) {
+      const messageId = String(row?.[6] || "");
+      if (messageId === msg.id) {
+        weekKey = String(row?.[1] || "");
+        employeName = String(row?.[2] || "");
+        break;
+      }
+    }
+
+    if (!weekKey || !employeName) {
+      await reaction.users.remove(user.id).catch(() => {});
+      await dmUserSafe(user, "⚠️ Impossible : je n’ai pas trouvé la semaine/l’employé lié à ce message (BOT_STATE).");
+      await logEvent("warn", "reaction", "state_not_found", `messageId=${msg.id}`, {
+        actorTag: user.tag,
+        actorId: user.id,
+        channelId: msg.channelId,
+      });
+      return;
+    }
+
+    // lock semaine
+    const locked = await isWeekLocked(sheets, weekKey);
+    if (locked) {
+      await reaction.users.remove(user.id).catch(() => {});
+      await dmUserSafe(user, `⛔ La semaine **${weekKey}** est verrouillée. (Aucun changement effectué)`);
+      await logEvent("info", "reaction", "locked", `week=${weekKey} ${employeName}`, {
+        actorTag: user.tag,
+        actorId: user.id,
+        week: weekKey,
+        target: employeName,
+      });
+      return;
+    }
+
+    // update Sheets
+    const newStatus = emoji === "✅" ? "Payé" : "Pas payé";
+    const ok = await updateSalaireStatus(sheets, weekKey, employeName, newStatus);
+
+    if (!ok) {
+      await reaction.users.remove(user.id).catch(() => {});
+      await dmUserSafe(user, `❌ Impossible de mettre à jour: employé introuvable dans la semaine **${weekKey}**.`);
+      await logEvent("error", "reaction", "update_failed", `week=${weekKey} ${employeName}`, {
+        actorTag: user.tag,
+        actorId: user.id,
+        week: weekKey,
+        target: employeName,
+      });
+      return;
+    }
+
+    await logEvent("info", "reaction", "status_changed", `${employeName} => ${newStatus} (${weekKey})`, {
+      actorTag: user.tag,
+      actorId: user.id,
+      week: weekKey,
+      target: employeName,
+    });
+
+    // refresh embed semaine (pas de ping)
+    const out = await syncSalairesWeek(weekKey);
+    await logEvent("info", "reaction", "embed_refresh", `week=${weekKey} created=${out.created} edited=${out.edited} skipped=${out.skipped}`, {
+      actorTag: user.tag,
+      actorId: user.id,
+      week: weekKey,
+    });
+
+    // nettoyer la réaction
+    await reaction.users.remove(user.id).catch(() => {});
+
+    // confirmation privée
+    await dmUserSafe(user, `✅ OK : **${employeName}** est maintenant **${newStatus}** pour **${weekKey}**.`);
+  } catch (e) {
+    await logEvent("error", "reaction", "handler_error", String(e?.stack || e || ""));
+  }
+});
+
 // ===================== PROCESS SAFETY =====================
 process.on("unhandledRejection", async (err) => {
   await logEvent("error", "process", "unhandledRejection", String(err?.stack || err || ""));
@@ -1306,13 +1398,11 @@ process.on("unhandledRejection", async (err) => {
 
 process.on("uncaughtException", async (err) => {
   await logEvent("error", "process", "uncaughtException", String(err?.stack || err || ""));
-  // sur un hébergeur, mieux de laisser redémarrer proprement
   process.exit(1);
 });
 
 // ===================== READY =====================
 client.once(Events.ClientReady, async () => {
-  // debug env (utile Koyeb)
   console.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
   console.log("[AUTO] AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
   console.log("[AUTO] AUTO_SYNC_WEEKS_BACK =", process.env.AUTO_SYNC_WEEKS_BACK);
@@ -1320,17 +1410,11 @@ client.once(Events.ClientReady, async () => {
 
   await logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`);
 
-  // ===== AUTO-SYNC SCHEDULER =====
+  // Auto-sync (si activé)
   if (AUTO_SYNC) {
     await logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
-
-    if (AUTO_SYNC_ON_START) {
-      runAutoSyncOnce().catch(() => {});
-    }
-
-    setInterval(() => {
-      runAutoSyncOnce().catch(() => {});
-    }, AUTO_SYNC_INTERVAL_SECONDS * 1000);
+    if (AUTO_SYNC_ON_START) runAutoSyncOnce().catch(() => {});
+    setInterval(() => runAutoSyncOnce().catch(() => {}), AUTO_SYNC_INTERVAL_SECONDS * 1000);
   }
 });
 
