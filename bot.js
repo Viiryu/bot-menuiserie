@@ -1,12 +1,12 @@
 /**
- * bot.js — LGW Comptabilité Bot (Machine de guerre)
+ * bot.js — LGW Comptabilité Bot (Machine de guerre) — PREMIUM EDITION
  *
- * ✅ Ultra-rapide sur ✅/❌ et /pay /unpay : update 1 seul salarié + update résumé (PAS de resync semaine)
+ * ✅ Ultra-rapide ✅/❌ et /pay /unpay : update cellule Sheets via sheetRow (BOT_STATE) + update embed ciblé
  * ✅ Résumé + embeds unitaires pour 4 historiques (salaires / commandes / rachat employé / rachat temporaire)
- * ✅ /rebuild* et /rebuildall : supprime + reposte résumé + unitaires (FORCE)
+ * ✅ /rebuild* et /rebuildall : purge + reposte résumé + unitaires (FORCE) — reposte même si lock (lock reste actif)
  * ✅ BOT_LINKS : /link /unlink /dellink + ping auto à la création (salaires)
  * ✅ Logs dans un channel + console
- * ✅ Cache Google Sheets + cache parse + cache state
+ * ✅ Cache Google Sheets + cache parse + cache state + cache header/colIndex
  * ✅ Autosync optionnel
  *
  * Dépendances :
@@ -61,8 +61,9 @@ const PAY_ROLE_IDS = (process.env.PAY_ROLE_IDS || "")
 // Perf knobs
 const FAST_MODE =
   String(process.env.FAST_MODE || "true").toLowerCase() === "true";
-const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 60); // cache Sheets/parse
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 90); // cache Sheets/parse
 const STATE_CACHE_TTL_SECONDS = Number(process.env.STATE_CACHE_TTL_SECONDS || 8); // cache états
+const HEADER_CACHE_TTL_SECONDS = Number(process.env.HEADER_CACHE_TTL_SECONDS || 600); // cache header/indices
 const MAX_ROWS_HISTORY = Number(process.env.MAX_ROWS_HISTORY || 2500); // ↓ plus bas = plus rapide
 const DISCORD_OP_DELAY_MS = Number(process.env.DISCORD_OP_DELAY_MS || 0); // 0 = rapide
 
@@ -70,11 +71,15 @@ const DISCORD_OP_DELAY_MS = Number(process.env.DISCORD_OP_DELAY_MS || 0); // 0 =
 const AUTO_SYNC =
   String(process.env.AUTO_SYNC || "false").toLowerCase() === "true";
 const AUTO_SYNC_INTERVAL_SECONDS = Number(
-  process.env.AUTO_SYNC_INTERVAL_SECONDS || 120
+  process.env.AUTO_SYNC_INTERVAL_SECONDS || 180
 );
 const AUTO_SYNC_WEEKS_BACK = Number(process.env.AUTO_SYNC_WEEKS_BACK || 2);
 const AUTO_SYNC_ON_START =
   String(process.env.AUTO_SYNC_ON_START || "true").toLowerCase() === "true";
+
+// Rebuild/Sync behavior
+const REBUILD_IGNORE_LOCK =
+  String(process.env.REBUILD_IGNORE_LOCK || "true").toLowerCase() === "true";
 
 if (!DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN manquant.");
@@ -109,10 +114,8 @@ const COLOR = {
   red: 0xe74c3c,
   gray: 0x95a5a6,
   ink: 0x2c3e50,
+  midnight: 0x111827, // premium dark
 };
-
-const DIV = "━━━━━━━━━━━━━━━━━━━━";
-const THIN = "────────────────────";
 
 /* ===================== UTILS ===================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -169,7 +172,11 @@ function safeMoney(v) {
 }
 function money(v) {
   const n = Number(v);
-  if (!Number.isFinite(n)) return String(v ?? "—");
+  if (!Number.isFinite(n)) {
+    // si déjà "250$" ou texte
+    const s = String(v ?? "—");
+    return s.includes("$") ? s : s;
+  }
   return `${safeMoney(n)}$`;
 }
 function num(v) {
@@ -189,10 +196,6 @@ function findFirstColumn(header, candidates) {
     if (idx !== -1) return idx;
   }
   return -1;
-}
-function codeBlock(lines) {
-  const body = Array.isArray(lines) ? lines.join("\n") : String(lines || "");
-  return "```yaml\n" + body + "\n```";
 }
 function statusEmoji(statutRaw) {
   const s = normName(statutRaw);
@@ -234,6 +237,21 @@ function splitEntrepriseLieu(raw) {
     }
   }
   return { entreprise: s, lieu: "—" };
+}
+function clamp(str, n) {
+  const s = String(str ?? "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+function colToA1(colIndex0) {
+  // 0->A, 25->Z, 26->AA ...
+  let n = colIndex0 + 1;
+  let out = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    out = String.fromCharCode(65 + r) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
 }
 
 /* ===================== SIMPLE IN-MEMORY CACHE ===================== */
@@ -292,17 +310,13 @@ async function sheetTitles(sheets) {
     .map((s) => s.properties?.title)
     .filter(Boolean);
 }
-async function ensureSheet(sheets, title, headerRow) {
+async function ensureSheet(sheets, title) {
   const titles = await sheetTitles(sheets);
   if (!titles.includes(title)) {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
       requestBody: { requests: [{ addSheet: { properties: { title } } }] },
     });
-  }
-  if (headerRow?.length) {
-    // si l'onglet existe déjà, on NE casse pas : on n'écrase pas.
-    // (On gère les extensions de colonnes via ensureSheetColumns)
   }
 }
 async function readRange(sheets, range) {
@@ -330,20 +344,19 @@ async function readSheetTableCached(
   const hit = FAST_MODE ? cacheGet(key) : null;
   if (hit) return hit;
 
-  const table = await readRange(sheets, `${sheetName}!A1:Z${maxRows}`);
+  const table = await readRange(sheets, `${sheetName}!A1:ZZ${maxRows}`);
   return cacheSet(key, table, CACHE_TTL_SECONDS);
 }
 function invalidateSheetCache(sheetName) {
   cacheDelPrefix(`table::${sheetName}::`);
   cacheDelPrefix(`parsed::${sheetName}::`);
+  cacheDelPrefix(`header::${sheetName}::`);
 }
 async function ensureSheetColumns(sheets, sheetTitle, requiredHeader) {
-  // Ajoute des colonnes à la fin si le header existant est plus court.
-  const cur = await readRange(sheets, `${sheetTitle}!A1:Z1`);
+  const cur = await readRange(sheets, `${sheetTitle}!A1:ZZ1`);
   const header = (cur[0] || []).map((x) => String(x || "").trim());
   if (!header.length) {
-    // header vide -> on écrit direct
-    const endCol = String.fromCharCode(64 + requiredHeader.length);
+    const endCol = colToA1(requiredHeader.length - 1);
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range: `${sheetTitle}!A1:${endCol}1`,
@@ -359,13 +372,43 @@ async function ensureSheetColumns(sheets, sheetTitle, requiredHeader) {
     newHeader[i] = requiredHeader[i] || "";
   }
 
-  const endCol = String.fromCharCode(64 + newHeader.length);
+  const endCol = colToA1(newHeader.length - 1);
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${sheetTitle}!A1:${endCol}1`,
     valueInputOption: "RAW",
     requestBody: { values: [newHeader] },
   });
+}
+
+/* ===================== HEADER/COL INDEX CACHE (FAST PAY/REACTIONS) ===================== */
+async function getHeaderMapCached(sheets, sheetName) {
+  const key = `header::${sheetName}`;
+  const hit = FAST_MODE ? cacheGet(key) : null;
+  if (hit) return hit;
+
+  const header = (await readRange(sheets, `${sheetName}!A1:ZZ1`))[0] || [];
+  const clean = header.map((h) => String(h || "").trim());
+  const map = new Map();
+  for (let i = 0; i < clean.length; i++) {
+    if (!clean[i]) continue;
+    map.set(clean[i], i);
+  }
+  return cacheSet(key, { header: clean, map }, HEADER_CACHE_TTL_SECONDS);
+}
+async function readRowObject(sheets, sheetName, rowIndex) {
+  const { header } = await getHeaderMapCached(sheets, sheetName);
+  const endCol = colToA1(Math.max(0, header.length - 1));
+  const row =
+    (await readRange(sheets, `${sheetName}!A${rowIndex}:${endCol}${rowIndex}`))[0] ||
+    [];
+  const obj = {};
+  for (let i = 0; i < header.length; i++) {
+    const k = header[i];
+    if (!k) continue;
+    obj[k] = row[i];
+  }
+  return obj;
 }
 
 /* ===================== PARSE HISTORY (cached) ===================== */
@@ -407,11 +450,7 @@ function parseHistory(table) {
 
   return { header, records };
 }
-async function getParsedCached(
-  sheets,
-  sheetName,
-  maxRows = MAX_ROWS_HISTORY
-) {
+async function getParsedCached(sheets, sheetName, maxRows = MAX_ROWS_HISTORY) {
   const key = `parsed::${sheetName}::${maxRows}`;
   const hit = FAST_MODE ? cacheGet(key) : null;
   if (hit) return hit;
@@ -419,16 +458,6 @@ async function getParsedCached(
   const table = await readSheetTableCached(sheets, sheetName, maxRows);
   const parsed = parseHistory(table);
   return cacheSet(key, parsed, CACHE_TTL_SECONDS);
-}
-async function readRowObject(sheets, sheetName, rowIndex, maxCol = "Z") {
-  const headerRow = (await readRange(sheets, `${sheetName}!A1:${maxCol}1`))[0] || [];
-  const row = (await readRange(sheets, `${sheetName}!A${rowIndex}:${maxCol}${rowIndex}`))[0] || [];
-  const obj = {};
-  for (let i = 0; i < headerRow.length; i++) {
-    const k = String(headerRow[i] || "").trim();
-    if (k) obj[k] = row[i];
-  }
-  return obj;
 }
 
 /* ===================== DISCORD CLIENT ===================== */
@@ -498,7 +527,7 @@ async function logEvent(level, source, action, message, meta = {}) {
   const embed = new EmbedBuilder()
     .setColor(LOG_COLORS[level] ?? COLOR.gray)
     .setTitle(`${LOG_ICONS[level] ?? "📝"} ${source}`)
-    .setDescription(`**${action}**\n${message}`)
+    .setDescription(`**${action}**\n${clamp(message, 3800)}`)
     .setFooter({ text: nowStr() })
     .setTimestamp(new Date());
 
@@ -521,14 +550,7 @@ async function logEvent(level, source, action, message, meta = {}) {
 /* ===================== LINKS (BOT_LINKS) ===================== */
 let _linksCache = { ts: 0, map: new Map() };
 async function readLinks(sheets) {
-  await ensureSheet(sheets, SHEET_BOT_LINKS, [
-    "telegramme",
-    "employeName",
-    "discordUserId",
-    "active",
-    "updatedAt",
-  ]);
-  // header minimal si vide
+  await ensureSheet(sheets, SHEET_BOT_LINKS);
   await ensureSheetColumns(sheets, SHEET_BOT_LINKS, [
     "telegramme",
     "employeName",
@@ -684,15 +706,7 @@ async function getEmployeNameByDiscordId(sheets, discordUserId) {
 
 /* ===================== STATE SHEETS ===================== */
 async function ensureStateSheet(sheets, title) {
-  await ensureSheet(sheets, title, [
-    "key",
-    "week",
-    "name",
-    "channelId",
-    "messageId",
-    "locked",
-    "hash",
-  ]);
+  await ensureSheet(sheets, title);
   await ensureSheetColumns(sheets, title, [
     "key",
     "week",
@@ -703,6 +717,7 @@ async function ensureStateSheet(sheets, title) {
     "hash",
   ]);
 }
+
 const SALAIRES_STATE_HEADER = [
   "key",
   "week",
@@ -715,10 +730,12 @@ const SALAIRES_STATE_HEADER = [
   "hash",
   "sheetRow", // ✅ pour update ultra-rapide
 ];
+
 async function ensureStateSheetSalaires(sheets) {
-  await ensureSheet(sheets, SHEET_BOT_STATE_SALAIRES, SALAIRES_STATE_HEADER);
+  await ensureSheet(sheets, SHEET_BOT_STATE_SALAIRES);
   await ensureSheetColumns(sheets, SHEET_BOT_STATE_SALAIRES, SALAIRES_STATE_HEADER);
 }
+
 async function readStateRowsCached(sheets, sheetTitle, max = 5000) {
   const key = `state::${sheetTitle}::${max}`;
   const hit = FAST_MODE ? cacheGet(key) : null;
@@ -728,6 +745,7 @@ async function readStateRowsCached(sheets, sheetTitle, max = 5000) {
   const rows = await readRange(sheets, `${sheetTitle}!A1:G${max}`);
   return cacheSet(key, rows, STATE_CACHE_TTL_SECONDS);
 }
+
 async function readStateRowsSalairesCached(sheets, max = 5000) {
   const key = `state::${SHEET_BOT_STATE_SALAIRES}::${max}`;
   const hit = FAST_MODE ? cacheGet(key) : null;
@@ -737,20 +755,14 @@ async function readStateRowsSalairesCached(sheets, max = 5000) {
   const rows = await readRange(sheets, `${SHEET_BOT_STATE_SALAIRES}!A1:J${max}`);
   return cacheSet(key, rows, STATE_CACHE_TTL_SECONDS);
 }
+
 function invalidateStateCache(sheetTitle) {
   cacheDelPrefix(`state::${sheetTitle}::`);
 }
 
 /* ===================== WEEK SUMMARY STATE ===================== */
 async function ensureWeekSummarySheet(sheets) {
-  await ensureSheet(sheets, SHEET_BOT_WEEK_SUMMARY, [
-    "key",
-    "week",
-    "kind",
-    "channelId",
-    "messageId",
-    "hash",
-  ]);
+  await ensureSheet(sheets, SHEET_BOT_WEEK_SUMMARY);
   await ensureSheetColumns(sheets, SHEET_BOT_WEEK_SUMMARY, [
     "key",
     "week",
@@ -792,14 +804,7 @@ async function upsertWeekSummaryMessage({
   if (!ch) throw new Error("Channel résumé introuvable.");
 
   const state = await readWeekSummaryStateCached(sheets);
-  const head = state[0] || [
-    "key",
-    "week",
-    "kind",
-    "channelId",
-    "messageId",
-    "hash",
-  ];
+  const head = state[0] || ["key", "week", "kind", "channelId", "messageId", "hash"];
   const rows = state.slice(1);
 
   const key = `SUMMARY::${kind}::${weekKey}`;
@@ -877,6 +882,7 @@ async function lockWeek(sheets, weekKey, lockValue) {
   invalidateStateCache(SHEET_BOT_STATE_SALAIRES);
   return changed;
 }
+
 function computeSalairesStatusFromParsed(parsed, weekKey) {
   const header = parsed.header;
   const records = parsed.records;
@@ -938,28 +944,60 @@ function computeSalairesStatusFromParsed(parsed, weekKey) {
     totalRachatMontant,
   };
 }
-async function updateSalaireStatus(sheets, weekKey, employeName, newStatus) {
-  // rapide : on repasse par parse cache pour trouver la rowIndex (si BOT_STATE a sheetRow c'est encore mieux via refreshOne)
+
+/**
+ * ✅ UPDATE STATUT (ULTRA RAPIDE)
+ * - On tente d'abord via BOT_STATE (sheetRow)
+ * - Sinon fallback parse (rare)
+ */
+async function updateSalaireStatusFast(sheets, weekKey, employeName, newStatus) {
+  const stateRows = await readStateRowsSalairesCached(sheets);
+  const data = stateRows.slice(1);
+
+  const targetNorm = normName(employeName);
+  let sheetRow = 0;
+
+  for (const r of data) {
+    const w = String(r?.[1] || "");
+    const n = String(r?.[2] || "");
+    if (w === String(weekKey) && normName(n) === targetNorm) {
+      sheetRow = Number(r?.[9] || 0);
+      break;
+    }
+  }
+
+  const { map } = await getHeaderMapCached(sheets, SHEET_SALAIRES);
+  const idxStatut = map.get("Statut au moment de la clôture");
+
+  if (idxStatut === undefined) {
+    throw new Error("Colonne 'Statut au moment de la clôture' introuvable.");
+  }
+
+  if (sheetRow > 0) {
+    const col = colToA1(idxStatut);
+    await updateCell(sheets, `${SHEET_SALAIRES}!${col}${sheetRow}`, newStatus);
+    invalidateSheetCache(SHEET_SALAIRES);
+    return true;
+  }
+
+  // fallback parse (si state pas à jour)
   const parsed = await getParsedCached(sheets, SHEET_SALAIRES);
   const header = parsed.header;
   const records = parsed.records;
-
-  const idxStatut = header.indexOf("Statut au moment de la clôture");
   const idxName = header.indexOf("Prénom et nom");
+  const idxStatut2 = header.indexOf("Statut au moment de la clôture");
 
-  if (idxStatut === -1 || idxName === -1) {
+  if (idxName === -1 || idxStatut2 === -1) {
     throw new Error("Colonnes manquantes dans Historique salaires.");
   }
 
   for (const r of records) {
     if (r.week !== weekKey) continue;
     const n = String(r.obj[header[idxName]] || "").trim();
-    if (normName(n) !== normName(employeName)) continue;
+    if (normName(n) !== targetNorm) continue;
 
-    const colLetter = String.fromCharCode(65 + idxStatut);
-    const range = `${SHEET_SALAIRES}!${colLetter}${r.rowIndex}`;
-    await updateCell(sheets, range, newStatus);
-
+    const col = colToA1(idxStatut2);
+    await updateCell(sheets, `${SHEET_SALAIRES}!${col}${r.rowIndex}`, newStatus);
     invalidateSheetCache(SHEET_SALAIRES);
     return true;
   }
@@ -1002,6 +1040,7 @@ function computeGenericRachatStatsFromParsed(parsed, weekKey) {
     "Total",
     "Prix",
     "Montant total",
+    "Montant rachat",
   ]);
 
   let count = 0;
@@ -1021,12 +1060,29 @@ function computeGenericRachatStatsFromParsed(parsed, weekKey) {
   return { count, total };
 }
 
-/* ===================== PREMIUM EMBEDS ===================== */
-// SALAIRES : "TOTAL PAYÉ" en gros + dans le titre
+/* ===================== PREMIUM EMBEDS (MAXI LISIBLE) ===================== */
+function botIconUrl() {
+  try {
+    return client.user?.displayAvatarURL?.() || null;
+  } catch {
+    return null;
+  }
+}
+function fmtLine(label, value) {
+  const v = value === undefined || value === null || String(value).trim() === "" ? "—" : String(value);
+  return `**${label}** : ${v}`;
+}
+function bullet(lines) {
+  return lines.filter(Boolean).map((l) => `• ${l}`).join("\n");
+}
+function bigTotalPaid(v) {
+  return `💵 **TOTAL PAYÉ : ${money(v)}**`;
+}
+
+/* ===== SALAIRES (TOTAL PAYÉ en GROS + statut très visible) ===== */
 function buildSalaireEmbedPremium(weekKey, obj) {
   const name = String(pick(obj, ["Prénom et nom"], "Employé"));
   const grade = String(pick(obj, ["Grade"], "—"));
-  const tel = String(pick(obj, ["Télégramme", "Telegramme"], "—"));
 
   const statut = String(
     pick(obj, ["Statut au moment de la clôture", "Statut"], "—")
@@ -1047,79 +1103,82 @@ function buildSalaireEmbedPremium(weekKey, obj) {
 
   const paid =
     normName(statut).includes("pay") && !normName(statut).includes("pas");
-  const badge = paid ? "🟢 PAYÉ" : "🔴 PAS PAYÉ";
+  const badge = paid ? "🟢 **PAYÉ**" : "🔴 **PAS PAYÉ**";
 
-  const top = [
-    `${DIV}`,
-    `📅 Semaine: ${weekKey}`,
-    `${THIN}`,
-    `👤 Employé: ${name}`,
-    `🎖️ Grade: ${grade}`,
-    `📟 Télégramme: ${tel}`,
-    `${THIN}`,
-    `📌 Statut: ${badge}`,
-    `💵 **TOTAL PAYÉ: ${money(totalPaye)}**`,
-    `${DIV}`,
-  ];
+  const header = [
+    `📅 **Semaine : ${weekKey}**`,
+    `👤 **Employé : ${name}**`,
+    `🎖️ **Grade : ${grade}**`,
+    `📌 Statut : ${badge}`,
+    "",
+    bigTotalPaid(totalPaye),
+  ].join("\n");
 
-  const pay = [
-    `Salaire: ${money(salaire)}`,
-    `Prime: ${money(prime)}`,
-    `${THIN}`,
-    `Total salaire: ${money(totalSalaire)}`,
-  ];
+  const fRemu = bullet([
+    fmtLine("Salaire", money(salaire)),
+    fmtLine("Prime", money(prime)),
+    `—`,
+    fmtLine("Total salaire", money(totalSalaire)),
+  ]);
 
-  const act = [
-    `Production: ${String(prod)}`,
-    `${THIN}`,
-    `Total payé: ${money(totalPaye)}`,
-  ];
+  const fAct = bullet([
+    fmtLine("Production", prod),
+    `—`,
+    fmtLine("Total payé", money(totalPaye)),
+  ]);
 
-  const rach = [
-    `Total rachat: ${safeMoney(totalRachat)}`,
-    `Montant rachat: ${money(montantRachat)}`,
-  ];
+  const fRach = bullet([
+    fmtLine("Total rachat", safeMoney(totalRachat)),
+    fmtLine("Montant rachat", money(montantRachat)),
+  ]);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`${stEmoji} Salaire — ${name} • TOTAL PAYÉ: ${money(totalPaye)}`)
-    .setDescription(codeBlock(top))
+    .setTitle(`${stEmoji} Salaire — ${name}`)
+    .setDescription(header)
     .addFields(
-      { name: "💰 Rémunération", value: codeBlock(pay), inline: true },
-      { name: "🪵 Activité", value: codeBlock(act), inline: true },
-      { name: "🔁 Rachats", value: codeBlock(rach), inline: true }
+      { name: "💰 Rémunération", value: fRemu || "—", inline: true },
+      { name: "🪵 Activité", value: fAct || "—", inline: true },
+      { name: "🔁 Rachats", value: fRach || "—", inline: true }
     )
     .setFooter({ text: `TOTAL PAYÉ : ${money(totalPaye)} • ${weekKey}` })
     .setTimestamp(new Date());
+
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Salaires", iconURL: icon });
+
+  return embed;
 }
 
-// COMMANDES : statut = traité & livré, entreprise/lieu scindé, contact sur 2 lignes, article + qté
+/* ===== COMMANDES (statut fixé, article+qté, client scindé, contact 2 lignes) ===== */
 function buildCommandeEmbedPremium(weekKey, obj) {
   const entrepriseRaw = pick(
     obj,
-    ["Entreprise", "Client", "Société", "Societe", "Entreprise / Lieu"],
+    ["Entreprise", "Client", "Société", "Societe", "Entreprise / Lieu", "Entreprise - Lieu"],
     "—"
   );
   const { entreprise, lieu } = splitEntrepriseLieu(entrepriseRaw);
 
   const contactName = pick(
     obj,
-    ["Contact", "Interlocuteur", "Nom du contact", "Contact client"],
+    ["Contact", "Interlocuteur", "Nom du contact", "Contact client", "Client (contact)"],
     ""
   );
   const contactTel = pick(
     obj,
-    ["Télégramme contact", "Telegramme contact", "Télégramme", "Telegramme"],
+    ["Télégramme contact", "Telegramme contact", "Télégramme", "Telegramme", "Tel", "Télégramme client"],
     ""
   );
-  const contact =
-    contactName && contactTel
-      ? `${contactName} | LGW-${String(contactTel).replace(/^LGW-?/i, "")}`
+
+  const telNorm = String(contactTel || "").replace(/^LGW-?/i, "");
+  const contactLine =
+    contactName && telNorm
+      ? `**Contact :** ${contactName} | LGW-${telNorm}`
       : contactName
-      ? contactName
-      : contactTel
-      ? `LGW-${String(contactTel).replace(/^LGW-?/i, "")}`
-      : "—";
+      ? `**Contact :** ${contactName}`
+      : telNorm
+      ? `**Contact :** LGW-${telNorm}`
+      : `**Contact :** —`;
 
   const article = pick(
     obj,
@@ -1140,48 +1199,55 @@ function buildCommandeEmbedPremium(weekKey, obj) {
       "Commande",
       "Produit (petit-bois/bois traité)",
       "Produit (petit-bois / bois traité)",
+      "Produit (petit bois/bois traité)",
+      "Produit (petit bois / bois traité)",
     ],
     "—"
   );
 
-  const qty = pick(obj, ["Quantité", "Qté", "Qte", "Nombre", "Nb"], "—");
+  const qty = pick(
+    obj,
+    ["Quantité", "Qté", "Qte", "Nombre", "Nb", "Quantité commandée", "Quantite commandee"],
+    "—"
+  );
+
   const montant = pick(obj, ["Montant", "Prix", "Total", "Montant total"], "—");
 
-  const head = [
-    `${DIV}`,
-    `📅 Semaine: ${weekKey}`,
-    `${THIN}`,
-    `✅ Statut: TRAITÉ & LIVRÉ`,
-    `${DIV}`,
-  ];
-
-  const clientBlock = [
-    `Entreprise: ${entreprise}`,
-    `Lieu: ${lieu}`,
-    `${THIN}`,
-    `Contact: ${contact}`,
-  ];
-
-  const detailBlock = [
-    `Article: ${article}`,
-    `Quantité: ${qty}`,
-    `${THIN}`,
-    `Montant: ${money(montant)}`,
-  ];
-
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(COLOR.green)
-    .setTitle(`📦 Commande — ${entreprise}`)
-    .setDescription(codeBlock(head))
+    .setTitle(`📦 Commande — ${clamp(entreprise, 64)}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        `✅ **Statut : TRAITÉ & LIVRÉ**`,
+        "",
+        `🏢 **Entreprise :** ${entreprise}`,
+        `📍 **Lieu :** ${lieu}`,
+        contactLine,
+      ].join("\n")
+    )
     .addFields(
-      { name: "🏢 Client", value: codeBlock(clientBlock), inline: false },
-      { name: "📄 Détails", value: codeBlock(detailBlock), inline: false }
+      {
+        name: "📄 Détails",
+        value: bullet([
+          fmtLine("Article", article),
+          fmtLine("Quantité", qty),
+          `—`,
+          fmtLine("Montant", money(montant)),
+        ]),
+        inline: false,
+      }
     )
     .setFooter({ text: `Commandes • ${weekKey}` })
     .setTimestamp(new Date());
+
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Commandes", iconURL: icon });
+
+  return embed;
 }
 
-// RACHAT EMPLOYÉ : quantité + objet (PAS de télégramme, tu l'as dans salaires)
+/* ===== RACHAT EMPLOYÉ (objet + quantité) ===== */
 function buildRachatEmployeEmbedPremium(weekKey, obj) {
   const name = pick(obj, ["Prénom et nom", "Employé", "Employe", "Nom"], "—");
 
@@ -1200,6 +1266,10 @@ function buildRachatEmployeEmbedPremium(weekKey, obj) {
       "Designation",
       "Objet / Item",
       "Objet / Produit",
+      "Produit racheté",
+      "Produit rachete",
+      "Article racheté",
+      "Article rachete",
     ],
     "—"
   );
@@ -1218,10 +1288,8 @@ function buildRachatEmployeEmbedPremium(weekKey, obj) {
       "Qte rachetee",
       "Quantité totale",
       "Quantite totale",
-      "Quantité totale rachetée",
-      "Quantite totale rachetee",
-      "Qte totale",
       "Qté totale",
+      "Qte totale",
     ],
     "—"
   );
@@ -1233,46 +1301,45 @@ function buildRachatEmployeEmbedPremium(weekKey, obj) {
   );
   const note = pick(obj, ["Note", "Commentaire", "Motif"], "");
 
-  const head = [
-    `${DIV}`,
-    `📅 Semaine: ${weekKey}`,
-    `${THIN}`,
-    `🧾 Type: RACHAT DIRECT`,
-    `${DIV}`,
-  ];
-
-  const who = [`Employé: ${name}`];
-
-  const what = [
-    `Objet: ${item}`,
-    `Quantité: ${qty}`,
-    `${THIN}`,
-    `Montant: ${money(montant)}`,
-  ];
-
   const embed = new EmbedBuilder()
     .setColor(COLOR.yellow)
-    .setTitle(`🧾 Rachat employé — ${name}`)
-    .setDescription(codeBlock(head))
-    .addFields(
-      { name: "👤 Identité", value: codeBlock(who), inline: false },
-      { name: "📦 Détail", value: codeBlock(what), inline: false }
+    .setTitle(`🧾 Rachat employé — ${clamp(String(name), 64)}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        `🧾 **Type : RACHAT DIRECT**`,
+        "",
+        `👤 **Employé :** ${name}`,
+      ].join("\n")
     )
+    .addFields({
+      name: "📦 Détail",
+      value: bullet([
+        fmtLine("Objet", item),
+        fmtLine("Quantité", qty),
+        `—`,
+        fmtLine("Montant", money(montant)),
+      ]),
+      inline: false,
+    })
     .setFooter({ text: `Rachat employé • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (note && String(note).trim() && note !== "—") {
     embed.addFields({
       name: "📝 Note",
-      value: String(note).slice(0, 1024),
+      value: clamp(note, 1024),
       inline: false,
     });
   }
 
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Rachat employé", iconURL: icon });
+
   return embed;
 }
 
-// RACHAT TEMPORAIRE : quantité + objet (vendu)
+/* ===== RACHAT TEMPORAIRE (vendu, objet + quantité) ===== */
 function buildRachatTempEmbedPremium(weekKey, obj) {
   const name = pick(obj, ["Prénom et nom", "Employé", "Employe", "Nom"], "—");
 
@@ -1291,6 +1358,8 @@ function buildRachatTempEmbedPremium(weekKey, obj) {
       "Item vendu",
       "Produit vendu",
       "Article vendu",
+      "Produit (vendu)",
+      "Article (vendu)",
     ],
     "—"
   );
@@ -1309,8 +1378,8 @@ function buildRachatTempEmbedPremium(weekKey, obj) {
       "Qte vendue",
       "Quantité totale",
       "Quantite totale",
-      "Qte totale",
       "Qté totale",
+      "Qte totale",
     ],
     "—"
   );
@@ -1318,101 +1387,113 @@ function buildRachatTempEmbedPremium(weekKey, obj) {
   const montant = pick(obj, ["Montant", "Prix", "Total", "Montant total"], "—");
   const note = pick(obj, ["Note", "Commentaire", "Motif"], "");
 
-  const head = [
-    `${DIV}`,
-    `📅 Semaine: ${weekKey}`,
-    `${THIN}`,
-    `✅ Statut: VENDU (sorti du stock)`,
-    `${DIV}`,
-  ];
-
-  const who = [`Employé: ${name}`];
-
-  const what = [
-    `Objet: ${item}`,
-    `Quantité: ${qty}`,
-    `${THIN}`,
-    `Montant: ${money(montant)}`,
-  ];
-
   const embed = new EmbedBuilder()
     .setColor(COLOR.purple)
-    .setTitle(`✅ Rachat temporaire — ${item}`)
-    .setDescription(codeBlock(head))
-    .addFields(
-      { name: "👤 Infos", value: codeBlock(who), inline: false },
-      { name: "📦 Détail", value: codeBlock(what), inline: false }
+    .setTitle(`✅ Rachat temporaire — ${clamp(String(item), 64)}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        `✅ **Statut : VENDU (sorti du stock)**`,
+        "",
+        `👤 **Employé :** ${name}`,
+      ].join("\n")
     )
+    .addFields({
+      name: "📦 Détail",
+      value: bullet([
+        fmtLine("Objet", item),
+        fmtLine("Quantité", qty),
+        `—`,
+        fmtLine("Montant", money(montant)),
+      ]),
+      inline: false,
+    })
     .setFooter({ text: `Rachat temporaire • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (note && String(note).trim() && note !== "—") {
     embed.addFields({
       name: "📝 Note",
-      value: String(note).slice(0, 1024),
+      value: clamp(note, 1024),
       inline: false,
     });
   }
 
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Rachat temporaire", iconURL: icon });
+
   return embed;
 }
 
-/* ===================== WEEK SUMMARY EMBEDS ===================== */
+/* ===================== WEEK SUMMARY EMBEDS (PREMIUM) ===================== */
 function buildWeekSummaryEmbedSalaires(weekKey, locked, st) {
   const color = locked ? COLOR.gray : st.unpaid > 0 ? COLOR.yellow : COLOR.green;
-  const badge = locked ? "🔒 VERROUILLÉE" : st.unpaid > 0 ? "🟡 EN ATTENTE" : "🟢 OK";
+  const badge = locked
+    ? "🔒 **VERROUILLÉE**"
+    : st.unpaid > 0
+    ? "🟡 **EN ATTENTE**"
+    : "🟢 **OK**";
 
-  const header = [
-    `${DIV}`,
-    `📌 RÉSUMÉ • SALAIRES`,
-    `${THIN}`,
-    `Semaine: ${weekKey}`,
-    `État: ${badge}`,
-    `${DIV}`,
-  ];
-
-  const bloc = [
-    `Employés: ${st.count}`,
-    `✅ Payé: ${st.paid}`,
-    `❌ Pas payé: ${st.unpaid}`,
-    `${THIN}`,
-    `💵 TOTAL PAYÉ: ${money(st.totalPaid)}`,
-    `${THIN}`,
-    `Total salaires: ${money(st.totalSalaire)}`,
-    `Total primes: ${money(st.totalPrime)}`,
-    `${THIN}`,
-    `Production: ${safeMoney(st.totalProd)}`,
-    `Montant rachats: ${money(st.totalRachatMontant)}`,
-  ];
-
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle("📌 Résumé de la semaine — Salaires")
-    .setDescription(codeBlock(header))
-    .addFields({ name: "📊 Synthèse", value: codeBlock(bloc), inline: false })
+    .setTitle(`📌 Résumé Salaires — ${weekKey}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        `📌 État : ${badge}`,
+        "",
+        bigTotalPaid(st.totalPaid),
+      ].join("\n")
+    )
+    .addFields(
+      {
+        name: "👥 Statuts",
+        value: bullet([
+          fmtLine("Employés", st.count),
+          fmtLine("✅ Payé", st.paid),
+          fmtLine("❌ Pas payé", st.unpaid),
+        ]),
+        inline: true,
+      },
+      {
+        name: "💰 Détails",
+        value: bullet([
+          fmtLine("Total salaires", money(st.totalSalaire)),
+          fmtLine("Total primes", money(st.totalPrime)),
+          fmtLine("Montant rachats", money(st.totalRachatMontant)),
+        ]),
+        inline: true,
+      },
+      {
+        name: "🪵 Production",
+        value: bullet([fmtLine("Quantité totale", safeMoney(st.totalProd))]),
+        inline: true,
+      }
+    )
     .setFooter({ text: `Résumé • ${weekKey}` })
     .setTimestamp(new Date());
+
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+
+  return embed;
 }
 
 function buildWeekSummaryEmbedCommandes(weekKey, st) {
   const color = st.count === 0 ? COLOR.gray : COLOR.green;
 
-  const header = [
-    `${DIV}`,
-    `📌 RÉSUMÉ • COMMANDES`,
-    `${THIN}`,
-    `Semaine: ${weekKey}`,
-    `✅ Statut global: TRAITÉ & LIVRÉ`,
-    `${DIV}`,
-  ];
-
-  const bloc = [`Commandes: ${st.count}`, `${THIN}`, `Total: ${money(st.total)}`];
-
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle("📌 Résumé de la semaine — Commandes")
-    .setDescription(codeBlock(header))
-    .addFields({ name: "📊 Synthèse", value: codeBlock(bloc), inline: false })
+    .setTitle(`📌 Résumé Commandes — ${weekKey}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        `✅ **Statut global : TRAITÉ & LIVRÉ**`,
+        "",
+        `📦 **Commandes : ${st.count}**`,
+        `💰 **Total : ${money(st.total)}**`,
+      ].join("\n")
+    )
     .setFooter({ text: `Résumé • ${weekKey}` })
     .setTimestamp(new Date());
 
@@ -1423,28 +1504,30 @@ function buildWeekSummaryEmbedCommandes(weekKey, st) {
       inline: false,
     });
   }
+
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+
   return embed;
 }
 
 function buildWeekSummaryEmbedRachat(kindLabel, weekKey, st, baseColor, subtitle) {
   const color = st.count === 0 ? COLOR.gray : baseColor;
 
-  const header = [
-    `${DIV}`,
-    `📌 RÉSUMÉ • ${kindLabel.toUpperCase()}`,
-    `${THIN}`,
-    `Semaine: ${weekKey}`,
-    subtitle ? subtitle : "",
-    `${DIV}`,
-  ].filter(Boolean);
-
-  const bloc = [`Entrées: ${st.count}`, `${THIN}`, `Total: ${money(st.total)}`];
-
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`📌 Résumé de la semaine — ${kindLabel}`)
-    .setDescription(codeBlock(header))
-    .addFields({ name: "📊 Synthèse", value: codeBlock(bloc), inline: false })
+    .setTitle(`📌 Résumé ${kindLabel} — ${weekKey}`)
+    .setDescription(
+      [
+        `📅 **Semaine : ${weekKey}**`,
+        subtitle ? `${subtitle}` : "",
+        "",
+        `📦 **Entrées : ${st.count}**`,
+        `💰 **Total : ${money(st.total)}**`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
     .setFooter({ text: `Résumé • ${weekKey}` })
     .setTimestamp(new Date());
 
@@ -1455,6 +1538,10 @@ function buildWeekSummaryEmbedRachat(kindLabel, weekKey, st, baseColor, subtitle
       inline: false,
     });
   }
+
+  const icon = botIconUrl();
+  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+
   return embed;
 }
 
@@ -1479,10 +1566,8 @@ async function refreshSalairesSummaryOnly(sheets, weekKey) {
 }
 
 /* ===================== SALAIRES: refresh UN SEUL message (ultra rapide) ===================== */
-async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId }) {
-  // trouver state row (par messageId si fourni, sinon week+name)
+async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId, ignoreLock = false }) {
   const stateRows = await readStateRowsSalairesCached(sheets);
-  const head = stateRows[0] || SALAIRES_STATE_HEADER;
   const data = stateRows.slice(1);
 
   let stRow = null;
@@ -1510,16 +1595,14 @@ async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId }
   if (!stRow) return { ok: false, reason: "state_not_found" };
 
   const locked = boolLocked(stRow[7]);
-  if (locked) return { ok: false, reason: "locked" };
+  if (locked && !ignoreLock) return { ok: false, reason: "locked" };
 
   const sheetRow = Number(stRow[9] || 0);
 
-  // lire uniquement la ligne
   let obj = null;
   if (sheetRow > 0) {
     obj = await readRowObject(sheets, SHEET_SALAIRES, sheetRow);
   } else {
-    // fallback rare : parse cache
     const parsed = await getParsedCached(sheets, SHEET_SALAIRES);
     const rec = parsed.records.find(
       (rr) =>
@@ -1539,6 +1622,7 @@ async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId }
   const mentionId = linksMap.get(normName(stRow[2]));
   const mention = mentionId ? `<@${mentionId}>` : "";
 
+  // ✅ IMPORTANT : on rebuild l'embed COMPLET (ça évite tout “V/X” qui casse le rendu)
   const embed = buildSalaireEmbedPremium(weekKey, obj);
   const newHash = sha({ week: weekKey, obj });
 
@@ -1554,13 +1638,7 @@ async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId }
     return { ok: false, reason: "discord_fetch_or_edit_failed" };
   }
 
-  // update hash en state (rapide : on rewrite juste la ligne via update range)
-  // (on garde header/structure, on ne casse pas)
-  // row in sheet is stIndex+2 (car header en ligne 1)
   const rowNum = stIndex + 2;
-
-  // maj colonnes : hash (I) + sheetRow (J si absent)
-  // range A..J (on réécrit la ligne complète pour être clean)
   const updatedRow = [...stRow];
   updatedRow[8] = newHash;
   updatedRow[9] = String(sheetRow || updatedRow[9] || "");
@@ -1577,7 +1655,7 @@ async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId }
 }
 
 /* ===================== SYNC: SALAIRES (Résumé + Unitaires) ===================== */
-async function syncSalairesWeek(weekKey, { force = false } = {}) {
+async function syncSalairesWeek(weekKey, { force = false, ignoreLockForUnitaires = false } = {}) {
   const sheets = await getSheets();
   await ensureStateSheetSalaires(sheets);
 
@@ -1602,8 +1680,11 @@ async function syncSalairesWeek(weekKey, { force = false } = {}) {
     force,
   });
 
-  // 🔒 lock => ne touche pas unitaires
-  if (locked) return { locked: true, created: 0, edited: 0, skipped: 0 };
+  // 🔒 lock => normalement on ne touche pas unitaires,
+  // mais en rebuild on veut pouvoir reposter => ignoreLockForUnitaires=true
+  if (locked && !ignoreLockForUnitaires) {
+    return { locked: true, created: 0, edited: 0, skipped: 0 };
+  }
 
   const weekRecords = parsed.records
     .filter((r) => r.week === weekKey)
@@ -1636,10 +1717,12 @@ async function syncSalairesWeek(weekKey, { force = false } = {}) {
     const oldLocked = st?.row?.[7];
     const oldHash = st?.row?.[8] ? String(st.row[8]) : "";
 
-    if (boolLocked(oldLocked)) {
+    // si la ligne a été lockée au niveau salarié, on respecte (même en force)
+    if (boolLocked(oldLocked) && !ignoreLockForUnitaires) {
       skipped++;
       continue;
     }
+
     if (!force && oldMsgId && oldHash === newHash) {
       skipped++;
       continue;
@@ -1669,7 +1752,7 @@ async function syncSalairesWeek(weekKey, { force = false } = {}) {
         row[4] = String(rec.obj["Télégramme"] || "");
         row[5] = SALAIRES_CHANNEL_ID;
         row[6] = oldMsgId;
-        row[7] = "";
+        row[7] = ignoreLockForUnitaires ? "true" : ""; // si week lock/rebuild, on garde lock actif
         row[8] = newHash;
         row[9] = String(rec.rowIndex);
         continue;
@@ -1696,7 +1779,7 @@ async function syncSalairesWeek(weekKey, { force = false } = {}) {
       row[4] = String(rec.obj["Télégramme"] || "");
       row[5] = SALAIRES_CHANNEL_ID;
       row[6] = msg.id;
-      row[7] = "";
+      row[7] = ignoreLockForUnitaires ? "true" : "";
       row[8] = newHash;
       row[9] = String(rec.rowIndex);
     } else {
@@ -1708,7 +1791,7 @@ async function syncSalairesWeek(weekKey, { force = false } = {}) {
         String(rec.obj["Télégramme"] || ""),
         SALAIRES_CHANNEL_ID,
         msg.id,
-        "",
+        ignoreLockForUnitaires ? "true" : "",
         newHash,
         String(rec.rowIndex),
       ]);
@@ -1860,7 +1943,7 @@ async function syncHistoryWeek({
         row[2] = String(
           pick(
             rec.obj,
-            ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article"],
+            ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article", "Produit"],
             `${kind} ${rec.rowIndex}`
           )
         );
@@ -1885,7 +1968,7 @@ async function syncHistoryWeek({
       row[2] = String(
         pick(
           rec.obj,
-          ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article"],
+          ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article", "Produit"],
           `${kind} ${rec.rowIndex}`
         )
       );
@@ -1900,7 +1983,7 @@ async function syncHistoryWeek({
         String(
           pick(
             rec.obj,
-            ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article"],
+            ["Client", "Entreprise", "Prénom et nom", "Nom", "Libellé", "Objet", "Article", "Produit"],
             `${kind} ${rec.rowIndex}`
           )
         ),
@@ -2195,7 +2278,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         week: semaine,
       });
 
-      // refresh résumé (rapide)
       await refreshSalairesSummaryOnly(sheets, semaine).catch(() => {});
       return interaction.editReply(
         cmd === "lock"
@@ -2215,12 +2297,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.editReply(`⛔ La semaine **${semaine}** est verrouillée.`);
       }
 
-      const ok = await updateSalaireStatus(sheets, semaine, employe, newStatus);
+      const ok = await updateSalaireStatusFast(sheets, semaine, employe, newStatus);
       if (!ok) return interaction.editReply(`❌ Employé introuvable pour **${semaine}** : "${employe}"`);
 
-      // 1) update 1 salarié (vite)
       await refreshSalaireOneFast({ sheets, weekKey: semaine, employeName: employe }).catch(() => {});
-      // 2) update résumé seulement
       await refreshSalairesSummaryOnly(sheets, semaine).catch(() => {});
 
       await logEvent("info", "salaires", cmd, `${employe} => ${newStatus}`, {
@@ -2248,7 +2328,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!employeName)
         return interaction.editReply(`❌ Aucun lien actif BOT_LINKS pour <@${user.id}>. Fais d’abord /link.`);
 
-      const ok = await updateSalaireStatus(sheets, semaine, employeName, newStatus);
+      const ok = await updateSalaireStatusFast(sheets, semaine, employeName, newStatus);
       if (!ok) return interaction.editReply(`❌ Employé introuvable dans Historique salaires: "${employeName}"`);
 
       await refreshSalaireOneFast({ sheets, weekKey: semaine, employeName }).catch(() => {});
@@ -2264,7 +2344,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return interaction.editReply(`✅ <@${user.id}> (**${employeName}**) → **${newStatus}** (compta + embed mis à jour)`);
     }
 
-    /* ===== SYNC SALAIRES (full) ===== */
+    /* ===== SYNC SALAIRES ===== */
     if (cmd === "syncsalaires") {
       await interaction.deferReply({ ephemeral: true });
       const semaine = interaction.options.getString("semaine");
@@ -2556,8 +2636,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       invalidateSheetCache(SHEET_RACHAT_EMPLOYE);
       invalidateSheetCache(SHEET_RACHAT_TEMP);
 
+      const ignoreLock = REBUILD_IGNORE_LOCK;
+
       const out = {};
-      out.sal = await syncSalairesWeek(weekKey, { force: true });
+      out.sal = await syncSalairesWeek(weekKey, { force: true, ignoreLockForUnitaires: ignoreLock });
       out.cmd = await syncHistoryWeek({
         weekKey,
         sheetName: SHEET_COMMANDES,
@@ -2612,7 +2694,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await purgeWeekSummary("salaires", semaine, SALAIRES_CHANNEL_ID);
       const pur = await purgeWeekSalairesState(semaine);
       invalidateSheetCache(SHEET_SALAIRES);
-      const out = await syncSalairesWeek(semaine, { force: true });
+      const out = await syncSalairesWeek(semaine, { force: true, ignoreLockForUnitaires: REBUILD_IGNORE_LOCK });
 
       return interaction.editReply(
         `✅ Rebuild salaires **${semaine}**\n` +
@@ -2718,7 +2800,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-/* ===================== ✅/❌ REACTIONS SUR SALAIRES (ULTRA RAPIDE) ===================== */
+/* ===================== ✅/❌ REACTIONS SUR SALAIRES (ULTRA RAPIDE + RENDU SAFE) ===================== */
 async function dmUserSafe(user, content) {
   try {
     await user.send(content);
@@ -2757,7 +2839,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const sheets = await getSheets();
 
-    // Trouve semaine + employé via BOT_STATE (par messageId)
+    // Trouve semaine + employé via BOT_STATE (par messageId) => O(n) mais cache 8s
     const stateRows = await readStateRowsSalairesCached(sheets);
     const data = stateRows.slice(1);
 
@@ -2798,8 +2880,8 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const newStatus = emoji === "✅" ? "Payé" : "Pas payé";
 
-    // update sheet statut (rapide)
-    const ok = await updateSalaireStatus(sheets, weekKey, employeName, newStatus);
+    // update sheet statut (ULTRA FAST)
+    const ok = await updateSalaireStatusFast(sheets, weekKey, employeName, newStatus);
     if (!ok) {
       await reaction.users.remove(user.id).catch(() => {});
       await dmUserSafe(user, `❌ Impossible de mettre à jour: employé introuvable dans **${weekKey}**.`);
@@ -2812,7 +2894,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
       return;
     }
 
-    // ✅ update 1 embed salarié + résumé seulement (ULTRA RAPIDE)
+    // ✅ IMPORTANT : on rebuild l'embed complet (aucun “V/X” texte)
     await refreshSalaireOneFast({ sheets, weekKey, employeName, messageId: msg.id }).catch(() => {});
     await refreshSalairesSummaryOnly(sheets, weekKey).catch(() => {});
 
@@ -2925,6 +3007,7 @@ client.once(Events.ClientReady, async () => {
   console.log("[PERF] CACHE_TTL_SECONDS =", CACHE_TTL_SECONDS);
   console.log("[PERF] MAX_ROWS_HISTORY =", MAX_ROWS_HISTORY);
   console.log("[PERF] DISCORD_OP_DELAY_MS =", DISCORD_OP_DELAY_MS);
+  console.log("[PERF] HEADER_CACHE_TTL_SECONDS =", HEADER_CACHE_TTL_SECONDS);
 
   console.log("[AUTO] AUTO_SYNC =", process.env.AUTO_SYNC);
   console.log("[AUTO] AUTO_SYNC_INTERVAL_SECONDS =", process.env.AUTO_SYNC_INTERVAL_SECONDS);
