@@ -27,7 +27,10 @@ const {
   Partials,
   Events,
   EmbedBuilder,
+  MessageFlagsBitField,
 } = require("discord.js");
+
+const { registerPart2, handlePart2Interaction } = require("./part2");
 
 /* ===================== HTTP (Koyeb / UptimeRobot) ===================== */
 const app = express();
@@ -76,6 +79,10 @@ const AUTO_SYNC_INTERVAL_SECONDS = Number(
 const AUTO_SYNC_WEEKS_BACK = Number(process.env.AUTO_SYNC_WEEKS_BACK || 2);
 const AUTO_SYNC_ON_START =
   String(process.env.AUTO_SYNC_ON_START || "true").toLowerCase() === "true";
+
+// Logs autosync (évite spam dans #logs)
+const AUTO_SYNC_LOG_RUNS =
+  String(process.env.AUTO_SYNC_LOG_RUNS || "false").toLowerCase() === "true";
 
 // Rebuild/Sync behavior
 const REBUILD_IGNORE_LOCK =
@@ -466,6 +473,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent,
   ],
   partials: [
     Partials.Channel,
@@ -474,6 +482,10 @@ const client = new Client({
     Partials.User,
   ],
 });
+
+// ===================== PART2 (logs/modération/communication) =====================
+registerPart2(client);
+
 
 /* ===================== AUTH ===================== */
 function hasPayRole(member) {
@@ -518,34 +530,52 @@ function nowStr() {
 const LOG_COLORS = { info: COLOR.green, warn: COLOR.yellow, error: COLOR.red };
 const LOG_ICONS = { info: "✅", warn: "⚠️", error: "❌" };
 
+let _logEventLast = new Map();
+const LOG_THROTTLE_MS = Number(process.env.LOG_THROTTLE_MS || 2000);
+
+
 async function logEvent(level, source, action, message, meta = {}) {
-  console.log(`[${level.toUpperCase()}] ${source} • ${action} ${message}`);
-
-  const ch = await resolveLogsChannel();
-  if (!ch) return;
-
-  const embed = new EmbedBuilder()
-    .setColor(LOG_COLORS[level] ?? COLOR.gray)
-    .setTitle(`${LOG_ICONS[level] ?? "📝"} ${source}`)
-    .setDescription(`**${action}**\n${clamp(message, 3800)}`)
-    .setFooter({ text: nowStr() })
-    .setTimestamp(new Date());
-
-  const fields = [];
-  for (const [k, v] of Object.entries(meta || {})) {
-    if (v === undefined || v === null || String(v).trim() === "") continue;
-    fields.push({
-      name: String(k).slice(0, 256),
-      value: String(v).slice(0, 1024),
-      inline: true,
-    });
-  }
-  if (fields.length) embed.addFields(fields.slice(0, 24));
-
   try {
-    await ch.send({ embeds: [embed] });
-  } catch {}
+    console.log(`[${String(level).toUpperCase()}] ${source} • ${action} ${message}`);
+
+    // Si le bot n'est pas prêt, on évite d'essayer Discord (console only)
+    if (!client?.isReady?.()) return;
+
+    const ch = await resolveLogsChannel();
+    if (!ch) return;
+
+    // Anti-spam: throttle logs identiques
+    const key = `${level}|${source}|${action}|${String(message).slice(0, 160)}`;
+    const now = Date.now();
+    const last = _logEventLast.get(key) || 0;
+    if (now - last < LOG_THROTTLE_MS) return;
+    _logEventLast.set(key, now);
+
+    const embed = new EmbedBuilder()
+      .setColor(LOG_COLORS[level] ?? COLOR.gray)
+      .setTitle(`${LOG_ICONS[level] ?? "📝"} ${source}`)
+      .setDescription(`**${action}**\n${clamp(message, 3800)}`)
+      .setFooter({ text: nowStr() })
+      .setTimestamp(new Date());
+
+    const fields = [];
+    for (const [k, v] of Object.entries(meta || {})) {
+      if (v === undefined || v === null || String(v).trim() === "") continue;
+      fields.push({
+        name: String(k).slice(0, 256),
+        value: String(v).slice(0, 1024),
+        inline: true,
+      });
+    }
+    if (fields.length) embed.addFields(fields.slice(0, 24));
+
+    await ch.send({ embeds: [embed] }).catch(() => {});
+  } catch (e) {
+    // IMPORTANT: ne jamais throw ici (sinon boucle unhandledRejection)
+    console.error("[logEvent] failed:", e?.message || e);
+  }
 }
+
 
 /* ===================== LINKS (BOT_LINKS) ===================== */
 let _linksCache = { ts: 0, map: new Map() };
@@ -2094,6 +2124,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 /* ===================== COMMANDES HANDLER ===================== */
 client.on(Events.InteractionCreate, async (interaction) => {
+  // PART2: laisse Part2 gérer ses commandes (et plus tard: modals/buttons)
+  try {
+    if (await handlePart2Interaction(interaction)) return;
+  } catch (e) {
+    console.error("[part2] handle interaction error:", e);
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
@@ -2115,10 +2152,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       "syncrachatemporaire",
       "syncall",
       "publish",
-      "link",
-      "unlink",
-      "dellink",
-      "rebuildsalaires",
+"rebuildsalaires",
       "rebuildcommandes",
       "rebuildrachatemploye",
       "rebuildrachattemp",
@@ -2134,7 +2168,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return interaction.reply({
         content: "⛔ Tu n’as pas la permission.",
-        ephemeral: true,
+        flags: MessageFlagsBitField.Flags.Ephemeral,
       });
     }
 
@@ -2142,7 +2176,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== LINKS ===== */
     if (cmd === "link") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const user = interaction.options.getUser("user");
       const employeName = interaction.options.getString("nom");
       const telegramme = interaction.options.getString("telegramme") || "";
@@ -2176,7 +2210,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "unlink") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const user = interaction.options.getUser("user");
       const result = await deactivateLink(sheets, user.id);
 
@@ -2194,7 +2228,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "dellink") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const user = interaction.options.getUser("user");
       const result = await deleteLinkRow(sheets, user.id);
 
@@ -2217,7 +2251,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== STATUS SALAIRES ===== */
     if (cmd === "salairesstatus") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
       const locked = await isWeekLocked(sheets, semaine);
       const parsed = await getParsedCached(sheets, SHEET_SALAIRES);
@@ -2247,7 +2281,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== STATUS COMMANDES ===== */
     if (cmd === "commandesstatus") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
       const parsed = await getParsedCached(sheets, SHEET_COMMANDES);
       const st = computeCommandesStatusFromParsed(parsed, semaine);
@@ -2268,7 +2302,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== LOCK / UNLOCK ===== */
     if (cmd === "lock" || cmd === "unlock") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
       const changed = await lockWeek(sheets, semaine, cmd === "lock");
 
@@ -2288,7 +2322,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PAY / UNPAY (ULTRA RAPIDE) ===== */
     if (cmd === "pay" || cmd === "unpay") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
       const employe = interaction.options.getString("employe");
       const newStatus = cmd === "pay" ? "Payé" : "Pas payé";
@@ -2315,7 +2349,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PAYUSER / UNPAYUSER (ULTRA RAPIDE) ===== */
     if (cmd === "payuser" || cmd === "unpayuser") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
       const user = interaction.options.getUser("user");
       const newStatus = cmd === "payuser" ? "Payé" : "Pas payé";
@@ -2346,7 +2380,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC SALAIRES ===== */
     if (cmd === "syncsalaires") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncSalairesWeek(semaine, { force: false });
@@ -2364,7 +2398,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC COMMANDES ===== */
     if (cmd === "synccommandes") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2387,7 +2421,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC RACHAT EMPLOYÉ ===== */
     if (cmd === "syncrachatemploye") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2410,7 +2444,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC RACHAT TEMPORAIRE ===== */
     if (cmd === "syncrachattemp" || cmd === "syncrachatemporaire") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2433,7 +2467,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC ALL ===== */
     if (cmd === "syncall") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const outSal = await syncSalairesWeek(semaine, { force: false }).catch((e) => ({ error: String(e?.message || e) }));
@@ -2464,7 +2498,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PUBLISH (résumé only pour rachats) ===== */
     if (cmd === "publish") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const type = interaction.options.getString("type");
       const semaine = interaction.options.getString("semaine");
 
@@ -2669,7 +2703,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildall") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       const r = await rebuildAllWeekForce(semaine);
@@ -2688,7 +2722,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildsalaires") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("salaires", semaine, SALAIRES_CHANNEL_ID);
@@ -2704,7 +2738,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildcommandes") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("commandes", semaine, COMMANDES_CHANNEL_ID);
@@ -2731,7 +2765,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildrachatemploye") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("rachat_employe", semaine, RACHAT_EMPLOYE_CHANNEL_ID);
@@ -2758,7 +2792,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildrachattemp") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("rachat_temp", semaine, RACHAT_TEMPORAIRE_CHANNEL_ID);
@@ -2784,7 +2818,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    return interaction.reply({ content: "❓ Commande non gérée côté bot.js.", ephemeral: true });
+    return interaction.reply({ content: "❓ Commande non gérée côté bot.js.", flags: MessageFlagsBitField.Flags.Ephemeral });
   } catch (e) {
     await logEvent("error", "command", `/${cmd}`, String(e?.stack || e || ""), {
       actorTag: interaction.user?.tag,
@@ -2796,7 +2830,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.deferred || interaction.replied) {
       return interaction.editReply({ content: `❌ Erreur: ${e?.message || e}` });
     }
-    return interaction.reply({ content: `❌ Erreur: ${e?.message || e}`, ephemeral: true });
+    return interaction.reply({ content: `❌ Erreur: ${e?.message || e}`, flags: MessageFlagsBitField.Flags.Ephemeral });
   }
 });
 
@@ -2925,13 +2959,11 @@ async function runAutoSyncOnce() {
       Math.max(1, AUTO_SYNC_WEEKS_BACK)
     );
 
-    await logEvent("info", "autosync", "run", `Weeks: ${weeks.join(", ")}`);
+    if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync", "run", `Weeks: ${weeks.join(", ")}`);
 
     for (const w of weeks) {
       const outSal = await syncSalairesWeek(w, { force: false });
-      await logEvent(
-        "info",
-        "autosync",
+      if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync",
         "salaires",
         `week=${w} c=${outSal.created} e=${outSal.edited} s=${outSal.skipped} locked=${outSal.locked}`,
         { week: w }
@@ -2945,9 +2977,7 @@ async function runAutoSyncOnce() {
         kind: "Commandes",
         force: false,
       });
-      await logEvent(
-        "info",
-        "autosync",
+      if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync",
         "commandes",
         `week=${w} c=${outCmd.created} e=${outCmd.edited} s=${outCmd.skipped}`,
         { week: w }
@@ -2961,9 +2991,7 @@ async function runAutoSyncOnce() {
         kind: "Rachat employé",
         force: false,
       });
-      await logEvent(
-        "info",
-        "autosync",
+      if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync",
         "rachat_employe",
         `week=${w} c=${outRE.created} e=${outRE.edited} s=${outRE.skipped}`,
         { week: w }
@@ -2977,9 +3005,7 @@ async function runAutoSyncOnce() {
         kind: "Rachat temporaire",
         force: false,
       });
-      await logEvent(
-        "info",
-        "autosync",
+      if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync",
         "rachat_temp",
         `week=${w} c=${outRT.created} e=${outRT.edited} s=${outRT.skipped}`,
         { week: w }
@@ -2994,12 +3020,26 @@ async function runAutoSyncOnce() {
 
 /* ===================== PROCESS SAFETY ===================== */
 process.on("unhandledRejection", async (err) => {
-  await logEvent("error", "process", "unhandledRejection", String(err?.stack || err || ""));
+  try {
+    console.error("[unhandledRejection]", err);
+    await logEvent("error", "process", "unhandledRejection", String(err?.stack || err || ""));
+  } catch (e) {
+    console.error("[unhandledRejection] logEvent failed:", e?.message || e);
+  }
 });
+
 process.on("uncaughtException", async (err) => {
-  await logEvent("error", "process", "uncaughtException", String(err?.stack || err || ""));
-  process.exit(1);
+  try {
+    console.error("[uncaughtException]", err);
+    await logEvent("error", "process", "uncaughtException", String(err?.stack || err || ""));
+  } catch (e) {
+    console.error("[uncaughtException] logEvent failed:", e?.message || e);
+  } finally {
+    // laisse un peu de temps aux logs pour se flush
+    setTimeout(() => process.exit(1), 500);
+  }
 });
+
 
 /* ===================== READY ===================== */
 client.once(Events.ClientReady, async () => {
@@ -3017,7 +3057,7 @@ client.once(Events.ClientReady, async () => {
   await logEvent("info", "bot", "startup", `✅ Bot prêt : ${client.user.tag}`);
 
   if (AUTO_SYNC) {
-    await logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
+    if (AUTO_SYNC_LOG_RUNS) await logEvent("info", "autosync", "enabled", `interval=${AUTO_SYNC_INTERVAL_SECONDS}s weeksBack=${AUTO_SYNC_WEEKS_BACK}`);
     if (AUTO_SYNC_ON_START) runAutoSyncOnce().catch(() => {});
     setInterval(() => runAutoSyncOnce().catch(() => {}), AUTO_SYNC_INTERVAL_SECONDS * 1000);
   }
