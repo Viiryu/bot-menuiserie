@@ -1,15 +1,17 @@
+// part2/index.js — routing Part2 (schedule + /say studio + modération/comm)
+// NOTE: On garde Part2 léger : pas de /studio séparés (tout passe par /say).
+
 const { startCacheGC } = require("./messageCache");
 const { registerMessageLogs } = require("./events/messageLogs");
 const { findCommand } = require("./commands");
 
-const { handleSayModal } = require("./modals/sayModals");
-const { handleEmbedStudioInteraction } = require("./studio/embedStudio");
-
 const { startScheduler } = require("./scheduler/schedulerRunner");
 const { handleScheduleModals } = require("./modals/scheduleModals");
-const { handleTextStudioInteraction } = require("./studio/textStudio");
 const { handleScheduleUIInteraction } = require("./scheduler/schedulerUI");
 
+// ✅ /say
+const { handleSayModals } = require("./modals/sayModals");
+const { handleSayComponents } = require("./components/sayComponents");
 
 function registerPart2(client) {
   const { loadSchedulesFromDisk } = require("./scheduler/schedulerState");
@@ -20,14 +22,13 @@ function registerPart2(client) {
 }
 
 async function handlePart2Interaction(interaction) {
-  // 1) Embed Studio (boutons + modals)
-  if (await handleEmbedStudioInteraction(interaction)) return true;
-if (await handleTextStudioInteraction(interaction)) return true;
-if (await handleScheduleUIInteraction(interaction)) return true;
+  // 1) /say (modals + components)
+  if (await handleSayModals(interaction)) return true;
+  if (await handleSayComponents(interaction)) return true;
 
-  // 2) Say text modal
-  if (await handleSayModal(interaction)) return true;
-if (await handleScheduleModals(interaction)) return true;
+  // 2) /schedule (UI + modals)
+  if (await handleScheduleUIInteraction(interaction)) return true;
+  if (await handleScheduleModals(interaction)) return true;
 
   // 3) Slash commands Part2
   if (interaction.isChatInputCommand && interaction.isChatInputCommand()) {

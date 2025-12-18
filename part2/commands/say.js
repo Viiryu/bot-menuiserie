@@ -1,64 +1,122 @@
+// part2/commands/say.js
 const {
   SlashCommandBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  MessageFlagsBitField,
 } = require("discord.js");
 
-const { IDS } = require("../constants");
+const { SAY_IDS } = require("../say/ids");
 const { isStaff } = require("../permissions");
 
-const data = new SlashCommandBuilder()
-  .setName("say")
-  .setDescription("Envoyer un message (texte ou embed)")
-  .setDMPermission(false)
-  .addSubcommand((s) => s.setName("text").setDescription("Message classique"))
-  .addSubcommand((s) => s.setName("embed").setDescription("Ouvrir l’Embed Studio (Draftbot-like)"));
+const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
 
-async function run(interaction) {
-  if (!(await isStaff(interaction.member))) {
-    return interaction.reply({ content: "❌ Réservé au staff.", flags: MessageFlags.Ephemeral
- });
-  }
+function buildTextModal() {
+  const modal = new ModalBuilder()
+    .setCustomId(SAY_IDS.MODAL_TEXT)
+    .setTitle("Studio /say — Message texte");
 
-  const sub = interaction.options.getSubcommand(true);
+  const content = new TextInputBuilder()
+    .setCustomId("content")
+    .setLabel("Message")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(2000)
+    .setPlaceholder("Écris ton message ici…");
 
-  // ======================
-  // /say text => modal texte
-  // ======================
-  if (sub === "text") {
-    const modal = new ModalBuilder()
-      .setCustomId(IDS.SAY_TEXT_MODAL)
-      .setTitle("📢 Say — Message");
-
-    const content = new TextInputBuilder()
-      .setCustomId("content")
-      .setLabel("Message")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(2000);
-
-    const ping = new TextInputBuilder()
-      .setCustomId("ping")
-      .setLabel("Mentions (optionnel) : userId/roleId, ex: 123,456")
-      .setStyle(TextInputStyle.Short)
-      .setRequired(false)
-      .setMaxLength(200);
-
-    modal.addComponents(
-      new ActionRowBuilder().addComponents(content),
-      new ActionRowBuilder().addComponents(ping)
-    );
-
-    return interaction.showModal(modal);
-  }
-
-  // ======================
-  // /say embed => ouvre Embed Studio
-  // ======================
-  const { openStudio } = require("../studio/embedStudio");
-  return openStudio(interaction);
+  modal.addComponents(new ActionRowBuilder().addComponents(content));
+  return modal;
 }
 
-module.exports = { name: "say", data, run };
+function buildEmbedBasicModal() {
+  const modal = new ModalBuilder()
+    .setCustomId(SAY_IDS.MODAL_EMBED_BASIC)
+    .setTitle("Studio /say — Embed (Base)");
+
+  const title = new TextInputBuilder()
+    .setCustomId("title")
+    .setLabel("Titre (optionnel)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(256);
+
+  const description = new TextInputBuilder()
+    .setCustomId("description")
+    .setLabel("Description")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000);
+
+  const color = new TextInputBuilder()
+    .setCustomId("color")
+    .setLabel("Couleur hex (optionnel) ex: #CBA135")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(16);
+
+  const footerText = new TextInputBuilder()
+    .setCustomId("footerText")
+    .setLabel("Footer (optionnel)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(2048);
+
+  const url = new TextInputBuilder()
+    .setCustomId("url")
+    .setLabel("URL (optionnel)")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(500);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(title),
+    new ActionRowBuilder().addComponents(description),
+    new ActionRowBuilder().addComponents(color),
+    new ActionRowBuilder().addComponents(footerText),
+    new ActionRowBuilder().addComponents(url)
+  );
+
+  return modal;
+}
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName(SAY_IDS.CMD_SAY)
+    .setDescription("Publie un message texte ou un embed (Studio intégré premium).")
+    .addSubcommand((s) =>
+      s.setName("text").setDescription("Créer un message texte (Studio intégré).")
+    )
+    .addSubcommand((s) =>
+      s.setName("embed").setDescription("Créer un embed (Studio intégré).")
+    ),
+
+  async execute(interaction) {
+    try {
+      if (!(await isStaff(interaction.member))) {
+        await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+        return;
+      }
+
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === "text") {
+        await interaction.showModal(buildTextModal());
+        return;
+      }
+
+      if (sub === "embed") {
+        await interaction.showModal(buildEmbedBasicModal());
+        return;
+      }
+
+      await interaction.reply({ content: "❌ Sous-commande inconnue.", flags: EPHEMERAL });
+    } catch (e) {
+      console.error("say.execute error:", e);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "❌ Erreur interne /say.", flags: EPHEMERAL }).catch(() => {});
+      }
+    }
+  },
+};

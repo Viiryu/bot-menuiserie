@@ -32,6 +32,12 @@ const {
 
 const { registerPart2, handlePart2Interaction } = require("./part2");
 
+// ✅ /say Studio intégré (modals + components) — branché dans le handler global
+const { handleSayModals } = require("./part2/modals/sayModals");
+const { handleSayComponents } = require("./part2/components/sayComponents");
+
+const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
+
 /* ===================== HTTP (Koyeb / UptimeRobot) ===================== */
 const app = express();
 app.get("/", (_, res) => res.status(200).send("OK"));
@@ -180,7 +186,6 @@ function safeMoney(v) {
 function money(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) {
-    // si déjà "250$" ou texte
     const s = String(v ?? "—");
     return s.includes("$") ? s : s;
   }
@@ -483,9 +488,8 @@ const client = new Client({
   ],
 });
 
-// ===================== PART2 (logs/modération/communication) =====================
+// ===================== PART2 (logs/modération/communication/schedule) =====================
 registerPart2(client);
-
 
 /* ===================== AUTH ===================== */
 function hasPayRole(member) {
@@ -533,18 +537,15 @@ const LOG_ICONS = { info: "✅", warn: "⚠️", error: "❌" };
 let _logEventLast = new Map();
 const LOG_THROTTLE_MS = Number(process.env.LOG_THROTTLE_MS || 2000);
 
-
 async function logEvent(level, source, action, message, meta = {}) {
   try {
     console.log(`[${String(level).toUpperCase()}] ${source} • ${action} ${message}`);
 
-    // Si le bot n'est pas prêt, on évite d'essayer Discord (console only)
     if (!client?.isReady?.()) return;
 
     const ch = await resolveLogsChannel();
     if (!ch) return;
 
-    // Anti-spam: throttle logs identiques
     const key = `${level}|${source}|${action}|${String(message).slice(0, 160)}`;
     const now = Date.now();
     const last = _logEventLast.get(key) || 0;
@@ -571,11 +572,9 @@ async function logEvent(level, source, action, message, meta = {}) {
 
     await ch.send({ embeds: [embed] }).catch(() => {});
   } catch (e) {
-    // IMPORTANT: ne jamais throw ici (sinon boucle unhandledRejection)
     console.error("[logEvent] failed:", e?.message || e);
   }
 }
-
 
 /* ===================== LINKS (BOT_LINKS) ===================== */
 let _linksCache = { ts: 0, map: new Map() };
@@ -1099,7 +1098,10 @@ function botIconUrl() {
   }
 }
 function fmtLine(label, value) {
-  const v = value === undefined || value === null || String(value).trim() === "" ? "—" : String(value);
+  const v =
+    value === undefined || value === null || String(value).trim() === ""
+      ? "—"
+      : String(value);
   return `**${label}** : ${v}`;
 }
 function bullet(lines) {
@@ -1108,8 +1110,11 @@ function bullet(lines) {
 function bigTotalPaid(v) {
   return `💵 **TOTAL PAYÉ : ${money(v)}**`;
 }
+function divider() {
+  return "━━━━━━━━━━━━━━━━━━";
+}
 
-/* ===== SALAIRES (TOTAL PAYÉ en GROS + statut très visible) ===== */
+/* ===== SALAIRES (MAX PREMIUM) ===== */
 function buildSalaireEmbedPremium(weekKey, obj) {
   const name = String(pick(obj, ["Prénom et nom"], "Employé"));
   const grade = String(pick(obj, ["Grade"], "—"));
@@ -1130,6 +1135,7 @@ function buildSalaireEmbedPremium(weekKey, obj) {
 
   const totalRachat = num(pick(obj, ["Total rachat"], 0));
   const montantRachat = num(pick(obj, ["Montant rachat"], 0));
+  const telegramme = String(pick(obj, ["Télégramme", "Telegramme"], "—"));
 
   const paid =
     normName(statut).includes("pay") && !normName(statut).includes("pas");
@@ -1139,21 +1145,22 @@ function buildSalaireEmbedPremium(weekKey, obj) {
     `📅 **Semaine : ${weekKey}**`,
     `👤 **Employé : ${name}**`,
     `🎖️ **Grade : ${grade}**`,
-    `📌 Statut : ${badge}`,
+    `📟 **Télégramme :** ${telegramme}`,
     "",
+    `📌 **Statut :** ${badge}  ${stEmoji}`,
+    "",
+    divider(),
     bigTotalPaid(totalPaye),
   ].join("\n");
 
   const fRemu = bullet([
     fmtLine("Salaire", money(salaire)),
     fmtLine("Prime", money(prime)),
-    `—`,
     fmtLine("Total salaire", money(totalSalaire)),
   ]);
 
   const fAct = bullet([
     fmtLine("Production", prod),
-    `—`,
     fmtLine("Total payé", money(totalPaye)),
   ]);
 
@@ -1164,39 +1171,69 @@ function buildSalaireEmbedPremium(weekKey, obj) {
 
   const embed = new EmbedBuilder()
     .setColor(color)
-    .setTitle(`${stEmoji} Salaire — ${name}`)
+    .setTitle(`${stEmoji} Salaire — ${clamp(name, 60)}`)
     .setDescription(header)
     .addFields(
       { name: "💰 Rémunération", value: fRemu || "—", inline: true },
       { name: "🪵 Activité", value: fAct || "—", inline: true },
-      { name: "🔁 Rachats", value: fRach || "—", inline: true }
+      { name: "🔁 Rachats", value: fRach || "—", inline: true },
+      {
+        name: "⚡ Actions rapides",
+        value: bullet(["`✅` = Payé", "`❌` = Pas payé", "`/pay` • `/unpay`"]),
+        inline: false,
+      }
     )
-    .setFooter({ text: `TOTAL PAYÉ : ${money(totalPaye)} • ${weekKey}` })
+    .setFooter({
+      text: `LGW • Salaires • ${weekKey} • Total payé: ${money(totalPaye)}`,
+    })
     .setTimestamp(new Date());
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Salaires", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Salaires", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
 
-/* ===== COMMANDES (statut fixé, article+qté, client scindé, contact 2 lignes) ===== */
+/* ===== COMMANDES (premium + montant mis en avant) ===== */
 function buildCommandeEmbedPremium(weekKey, obj) {
   const entrepriseRaw = pick(
     obj,
-    ["Entreprise", "Client", "Société", "Societe", "Entreprise / Lieu", "Entreprise - Lieu"],
+    [
+      "Entreprise",
+      "Client",
+      "Société",
+      "Societe",
+      "Entreprise / Lieu",
+      "Entreprise - Lieu",
+    ],
     "—"
   );
   const { entreprise, lieu } = splitEntrepriseLieu(entrepriseRaw);
 
   const contactName = pick(
     obj,
-    ["Contact", "Interlocuteur", "Nom du contact", "Contact client", "Client (contact)"],
+    [
+      "Contact",
+      "Interlocuteur",
+      "Nom du contact",
+      "Contact client",
+      "Client (contact)",
+    ],
     ""
   );
   const contactTel = pick(
     obj,
-    ["Télégramme contact", "Telegramme contact", "Télégramme", "Telegramme", "Tel", "Télégramme client"],
+    [
+      "Télégramme contact",
+      "Telegramme contact",
+      "Télégramme",
+      "Telegramme",
+      "Tel",
+      "Télégramme client",
+    ],
     ""
   );
 
@@ -1237,7 +1274,15 @@ function buildCommandeEmbedPremium(weekKey, obj) {
 
   const qty = pick(
     obj,
-    ["Quantité", "Qté", "Qte", "Nombre", "Nb", "Quantité commandée", "Quantite commandee"],
+    [
+      "Quantité",
+      "Qté",
+      "Qte",
+      "Nombre",
+      "Nb",
+      "Quantité commandée",
+      "Quantite commandee",
+    ],
     "—"
   );
 
@@ -1254,30 +1299,29 @@ function buildCommandeEmbedPremium(weekKey, obj) {
         `🏢 **Entreprise :** ${entreprise}`,
         `📍 **Lieu :** ${lieu}`,
         contactLine,
+        "",
+        divider(),
+        `💰 **Montant : ${money(montant)}**`,
       ].join("\n")
     )
-    .addFields(
-      {
-        name: "📄 Détails",
-        value: bullet([
-          fmtLine("Article", article),
-          fmtLine("Quantité", qty),
-          `—`,
-          fmtLine("Montant", money(montant)),
-        ]),
-        inline: false,
-      }
-    )
-    .setFooter({ text: `Commandes • ${weekKey}` })
+    .addFields({
+      name: "📄 Détails",
+      value: bullet([fmtLine("Article", article), fmtLine("Quantité", qty)]),
+      inline: false,
+    })
+    .setFooter({ text: `LGW • Commandes • ${weekKey}` })
     .setTimestamp(new Date());
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Commandes", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Commandes", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
 
-/* ===== RACHAT EMPLOYÉ (objet + quantité) ===== */
+/* ===== RACHAT EMPLOYÉ (premium) ===== */
 function buildRachatEmployeEmbedPremium(weekKey, obj) {
   const name = pick(obj, ["Prénom et nom", "Employé", "Employe", "Nom"], "—");
 
@@ -1340,19 +1384,17 @@ function buildRachatEmployeEmbedPremium(weekKey, obj) {
         `🧾 **Type : RACHAT DIRECT**`,
         "",
         `👤 **Employé :** ${name}`,
+        "",
+        divider(),
+        `💰 **Montant : ${money(montant)}**`,
       ].join("\n")
     )
     .addFields({
       name: "📦 Détail",
-      value: bullet([
-        fmtLine("Objet", item),
-        fmtLine("Quantité", qty),
-        `—`,
-        fmtLine("Montant", money(montant)),
-      ]),
+      value: bullet([fmtLine("Objet", item), fmtLine("Quantité", qty)]),
       inline: false,
     })
-    .setFooter({ text: `Rachat employé • ${weekKey}` })
+    .setFooter({ text: `LGW • Rachat employé • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (note && String(note).trim() && note !== "—") {
@@ -1364,12 +1406,15 @@ function buildRachatEmployeEmbedPremium(weekKey, obj) {
   }
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Rachat employé", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Rachat employé", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
 
-/* ===== RACHAT TEMPORAIRE (vendu, objet + quantité) ===== */
+/* ===== RACHAT TEMPORAIRE (premium) ===== */
 function buildRachatTempEmbedPremium(weekKey, obj) {
   const name = pick(obj, ["Prénom et nom", "Employé", "Employe", "Nom"], "—");
 
@@ -1426,19 +1471,17 @@ function buildRachatTempEmbedPremium(weekKey, obj) {
         `✅ **Statut : VENDU (sorti du stock)**`,
         "",
         `👤 **Employé :** ${name}`,
+        "",
+        divider(),
+        `💰 **Montant : ${money(montant)}**`,
       ].join("\n")
     )
     .addFields({
       name: "📦 Détail",
-      value: bullet([
-        fmtLine("Objet", item),
-        fmtLine("Quantité", qty),
-        `—`,
-        fmtLine("Montant", money(montant)),
-      ]),
+      value: bullet([fmtLine("Objet", item), fmtLine("Quantité", qty)]),
       inline: false,
     })
-    .setFooter({ text: `Rachat temporaire • ${weekKey}` })
+    .setFooter({ text: `LGW • Rachat temporaire • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (note && String(note).trim() && note !== "—") {
@@ -1450,7 +1493,10 @@ function buildRachatTempEmbedPremium(weekKey, obj) {
   }
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Rachat temporaire", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Rachat temporaire", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
@@ -1472,6 +1518,7 @@ function buildWeekSummaryEmbedSalaires(weekKey, locked, st) {
         `📅 **Semaine : ${weekKey}**`,
         `📌 État : ${badge}`,
         "",
+        divider(),
         bigTotalPaid(st.totalPaid),
       ].join("\n")
     )
@@ -1498,13 +1545,25 @@ function buildWeekSummaryEmbedSalaires(weekKey, locked, st) {
         name: "🪵 Production",
         value: bullet([fmtLine("Quantité totale", safeMoney(st.totalProd))]),
         inline: true,
+      },
+      {
+        name: "🧭 Guidance",
+        value: bullet([
+          "Réactions `✅/❌` sur un salaire = bascule Payé/Pas payé",
+          "`/pay` • `/unpay` = ciblage direct",
+          "`/lock` = verrouille la semaine",
+        ]),
+        inline: false,
       }
     )
-    .setFooter({ text: `Résumé • ${weekKey}` })
+    .setFooter({ text: `LGW • Résumé • ${weekKey}` })
     .setTimestamp(new Date());
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
@@ -1520,11 +1579,12 @@ function buildWeekSummaryEmbedCommandes(weekKey, st) {
         `📅 **Semaine : ${weekKey}**`,
         `✅ **Statut global : TRAITÉ & LIVRÉ**`,
         "",
+        divider(),
         `📦 **Commandes : ${st.count}**`,
         `💰 **Total : ${money(st.total)}**`,
       ].join("\n")
     )
-    .setFooter({ text: `Résumé • ${weekKey}` })
+    .setFooter({ text: `LGW • Résumé • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (st.count === 0) {
@@ -1536,7 +1596,10 @@ function buildWeekSummaryEmbedCommandes(weekKey, st) {
   }
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
@@ -1552,13 +1615,14 @@ function buildWeekSummaryEmbedRachat(kindLabel, weekKey, st, baseColor, subtitle
         `📅 **Semaine : ${weekKey}**`,
         subtitle ? `${subtitle}` : "",
         "",
+        divider(),
         `📦 **Entrées : ${st.count}**`,
         `💰 **Total : ${money(st.total)}**`,
       ]
         .filter(Boolean)
         .join("\n")
     )
-    .setFooter({ text: `Résumé • ${weekKey}` })
+    .setFooter({ text: `LGW • Résumé • ${weekKey}` })
     .setTimestamp(new Date());
 
   if (st.count === 0) {
@@ -1570,7 +1634,10 @@ function buildWeekSummaryEmbedRachat(kindLabel, weekKey, st, baseColor, subtitle
   }
 
   const icon = botIconUrl();
-  if (icon) embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+  if (icon) {
+    embed.setAuthor({ name: "Le Secrétaire — Résumé", iconURL: icon });
+    embed.setThumbnail(icon);
+  }
 
   return embed;
 }
@@ -1652,7 +1719,6 @@ async function refreshSalaireOneFast({ sheets, weekKey, employeName, messageId, 
   const mentionId = linksMap.get(normName(stRow[2]));
   const mention = mentionId ? `<@${mentionId}>` : "";
 
-  // ✅ IMPORTANT : on rebuild l'embed COMPLET (ça évite tout “V/X” qui casse le rendu)
   const embed = buildSalaireEmbedPremium(weekKey, obj);
   const newHash = sha({ week: weekKey, obj });
 
@@ -1710,8 +1776,6 @@ async function syncSalairesWeek(weekKey, { force = false, ignoreLockForUnitaires
     force,
   });
 
-  // 🔒 lock => normalement on ne touche pas unitaires,
-  // mais en rebuild on veut pouvoir reposter => ignoreLockForUnitaires=true
   if (locked && !ignoreLockForUnitaires) {
     return { locked: true, created: 0, edited: 0, skipped: 0 };
   }
@@ -1733,9 +1797,7 @@ async function syncSalairesWeek(weekKey, { force = false, ignoreLockForUnitaires
     if (k) map.set(k, { i, row });
   }
 
-  let created = 0,
-    edited = 0,
-    skipped = 0;
+  let created = 0, edited = 0, skipped = 0;
 
   for (const rec of weekRecords) {
     const employeName = String(rec.obj["Prénom et nom"] || "").trim();
@@ -1747,7 +1809,6 @@ async function syncSalairesWeek(weekKey, { force = false, ignoreLockForUnitaires
     const oldLocked = st?.row?.[7];
     const oldHash = st?.row?.[8] ? String(st.row[8]) : "";
 
-    // si la ligne a été lockée au niveau salarié, on respecte (même en force)
     if (boolLocked(oldLocked) && !ignoreLockForUnitaires) {
       skipped++;
       continue;
@@ -1782,7 +1843,7 @@ async function syncSalairesWeek(weekKey, { force = false, ignoreLockForUnitaires
         row[4] = String(rec.obj["Télégramme"] || "");
         row[5] = SALAIRES_CHANNEL_ID;
         row[6] = oldMsgId;
-        row[7] = ignoreLockForUnitaires ? "true" : ""; // si week lock/rebuild, on garde lock actif
+        row[7] = ignoreLockForUnitaires ? "true" : "";
         row[8] = newHash;
         row[9] = String(rec.rowIndex);
         continue;
@@ -1925,9 +1986,7 @@ async function syncHistoryWeek({
     if (k) map.set(k, { i, row });
   }
 
-  let created = 0,
-    edited = 0,
-    skipped = 0;
+  let created = 0, edited = 0, skipped = 0;
 
   for (const rec of weekRecords) {
     const hasAny = Object.values(rec.obj || {}).some(
@@ -1954,10 +2013,8 @@ async function syncHistoryWeek({
 
     let embed;
     if (kind === "Commandes") embed = buildCommandeEmbedPremium(weekKey, rec.obj);
-    else if (kind === "Rachat employé")
-      embed = buildRachatEmployeEmbedPremium(weekKey, rec.obj);
-    else if (kind === "Rachat temporaire")
-      embed = buildRachatTempEmbedPremium(weekKey, rec.obj);
+    else if (kind === "Rachat employé") embed = buildRachatEmployeEmbedPremium(weekKey, rec.obj);
+    else if (kind === "Rachat temporaire") embed = buildRachatTempEmbedPremium(weekKey, rec.obj);
     else embed = new EmbedBuilder().setColor(COLOR.gray).setTitle(kind);
 
     if (oldMsgId) {
@@ -2124,8 +2181,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 /* ===================== COMMANDES HANDLER ===================== */
 client.on(Events.InteractionCreate, async (interaction) => {
-  // PART2: laisse Part2 gérer ses commandes (et plus tard: modals/buttons)
+  // ✅ /say Studio intégré : modals + boutons + select (en premier)
   try {
+    if (await handleSayModals(interaction)) return;
+    if (await handleSayComponents(interaction)) return;
+
+    // PART2: schedule/modération/communication
     if (await handlePart2Interaction(interaction)) return;
   } catch (e) {
     console.error("[part2] handle interaction error:", e);
@@ -2152,7 +2213,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       "syncrachatemporaire",
       "syncall",
       "publish",
-"rebuildsalaires",
+      "rebuildsalaires",
       "rebuildcommandes",
       "rebuildrachatemploye",
       "rebuildrachattemp",
@@ -2168,7 +2229,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return interaction.reply({
         content: "⛔ Tu n’as pas la permission.",
-        flags: MessageFlagsBitField.Flags.Ephemeral,
+        flags: EPHEMERAL,
       });
     }
 
@@ -2176,7 +2237,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== LINKS ===== */
     if (cmd === "link") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const user = interaction.options.getUser("user");
       const employeName = interaction.options.getString("nom");
       const telegramme = interaction.options.getString("telegramme") || "";
@@ -2210,7 +2271,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "unlink") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const user = interaction.options.getUser("user");
       const result = await deactivateLink(sheets, user.id);
 
@@ -2228,7 +2289,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "dellink") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const user = interaction.options.getUser("user");
       const result = await deleteLinkRow(sheets, user.id);
 
@@ -2251,7 +2312,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== STATUS SALAIRES ===== */
     if (cmd === "salairesstatus") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
       const locked = await isWeekLocked(sheets, semaine);
       const parsed = await getParsedCached(sheets, SHEET_SALAIRES);
@@ -2281,7 +2342,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== STATUS COMMANDES ===== */
     if (cmd === "commandesstatus") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
       const parsed = await getParsedCached(sheets, SHEET_COMMANDES);
       const st = computeCommandesStatusFromParsed(parsed, semaine);
@@ -2302,7 +2363,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== LOCK / UNLOCK ===== */
     if (cmd === "lock" || cmd === "unlock") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
       const changed = await lockWeek(sheets, semaine, cmd === "lock");
 
@@ -2322,7 +2383,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PAY / UNPAY (ULTRA RAPIDE) ===== */
     if (cmd === "pay" || cmd === "unpay") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
       const employe = interaction.options.getString("employe");
       const newStatus = cmd === "pay" ? "Payé" : "Pas payé";
@@ -2349,7 +2410,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PAYUSER / UNPAYUSER (ULTRA RAPIDE) ===== */
     if (cmd === "payuser" || cmd === "unpayuser") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
       const user = interaction.options.getUser("user");
       const newStatus = cmd === "payuser" ? "Payé" : "Pas payé";
@@ -2380,7 +2441,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC SALAIRES ===== */
     if (cmd === "syncsalaires") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncSalairesWeek(semaine, { force: false });
@@ -2398,7 +2459,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC COMMANDES ===== */
     if (cmd === "synccommandes") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2421,7 +2482,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC RACHAT EMPLOYÉ ===== */
     if (cmd === "syncrachatemploye") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2444,7 +2505,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC RACHAT TEMPORAIRE ===== */
     if (cmd === "syncrachattemp" || cmd === "syncrachatemporaire") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const out = await syncHistoryWeek({
@@ -2467,7 +2528,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== SYNC ALL ===== */
     if (cmd === "syncall") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const outSal = await syncSalairesWeek(semaine, { force: false }).catch((e) => ({ error: String(e?.message || e) }));
@@ -2498,7 +2559,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     /* ===== PUBLISH (résumé only pour rachats) ===== */
     if (cmd === "publish") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const type = interaction.options.getString("type");
       const semaine = interaction.options.getString("semaine");
 
@@ -2703,7 +2764,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildall") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       const r = await rebuildAllWeekForce(semaine);
@@ -2722,7 +2783,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildsalaires") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("salaires", semaine, SALAIRES_CHANNEL_ID);
@@ -2738,7 +2799,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildcommandes") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("commandes", semaine, COMMANDES_CHANNEL_ID);
@@ -2765,7 +2826,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildrachatemploye") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("rachat_employe", semaine, RACHAT_EMPLOYE_CHANNEL_ID);
@@ -2792,7 +2853,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (cmd === "rebuildrachattemp") {
-      await interaction.deferReply({ flags: MessageFlagsBitField.Flags.Ephemeral });
+      await interaction.deferReply({ flags: EPHEMERAL });
       const semaine = interaction.options.getString("semaine");
 
       await purgeWeekSummary("rachat_temp", semaine, RACHAT_TEMPORAIRE_CHANNEL_ID);
@@ -2818,7 +2879,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    return interaction.reply({ content: "❓ Commande non gérée côté bot.js.", flags: MessageFlagsBitField.Flags.Ephemeral });
+    return interaction.reply({ content: "❓ Commande non gérée côté bot.js.", flags: EPHEMERAL });
   } catch (e) {
     await logEvent("error", "command", `/${cmd}`, String(e?.stack || e || ""), {
       actorTag: interaction.user?.tag,
@@ -2830,7 +2891,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.deferred || interaction.replied) {
       return interaction.editReply({ content: `❌ Erreur: ${e?.message || e}` });
     }
-    return interaction.reply({ content: `❌ Erreur: ${e?.message || e}`, flags: MessageFlagsBitField.Flags.Ephemeral });
+    return interaction.reply({ content: `❌ Erreur: ${e?.message || e}`, flags: EPHEMERAL });
   }
 });
 
@@ -2873,7 +2934,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const sheets = await getSheets();
 
-    // Trouve semaine + employé via BOT_STATE (par messageId) => O(n) mais cache 8s
     const stateRows = await readStateRowsSalairesCached(sheets);
     const data = stateRows.slice(1);
 
@@ -2914,7 +2974,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
 
     const newStatus = emoji === "✅" ? "Payé" : "Pas payé";
 
-    // update sheet statut (ULTRA FAST)
     const ok = await updateSalaireStatusFast(sheets, weekKey, employeName, newStatus);
     if (!ok) {
       await reaction.users.remove(user.id).catch(() => {});
@@ -2928,7 +2987,6 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
       return;
     }
 
-    // ✅ IMPORTANT : on rebuild l'embed complet (aucun “V/X” texte)
     await refreshSalaireOneFast({ sheets, weekKey, employeName, messageId: msg.id }).catch(() => {});
     await refreshSalairesSummaryOnly(sheets, weekKey).catch(() => {});
 
@@ -3035,11 +3093,9 @@ process.on("uncaughtException", async (err) => {
   } catch (e) {
     console.error("[uncaughtException] logEvent failed:", e?.message || e);
   } finally {
-    // laisse un peu de temps aux logs pour se flush
     setTimeout(() => process.exit(1), 500);
   }
 });
-
 
 /* ===================== READY ===================== */
 client.once(Events.ClientReady, async () => {
