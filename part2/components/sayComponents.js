@@ -5,19 +5,42 @@ const {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  PermissionsBitField,
 } = require("discord.js");
 
 const { SAY_IDS } = require("../say/ids");
 const { isStaff } = require("../permissions");
 const { getSayDraft, patchSayDraft, clearSayDraft } = require("../say/sayState");
-const { buildStudioPreviewPayload, buildOutboundPayloadFromDraft } = require("../say/sayPreview");
+const {
+  buildStudioPreviewPayload,
+  buildOutboundPayloadFromDraft,
+} = require("../say/sayPreview");
 const { buildMediaModal, buildActionsModal } = require("../modals/sayModals");
 
 const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
 
+/* ===================== COOLDOWN (anti spam) ===================== */
+const _cooldown = new Map(); // userId -> ts
+const COOLDOWN_MS = 6000;
+
+function isOnCooldown(userId) {
+  const now = Date.now();
+  const last = _cooldown.get(userId) || 0;
+  if (now - last < COOLDOWN_MS) return true;
+  _cooldown.set(userId, now);
+  return false;
+}
+
+function containsEveryonePing(content) {
+  const s = String(content || "");
+  return s.includes("@everyone") || s.includes("@here");
+}
+
 function isSayButtonId(id) {
   return [
     SAY_IDS.BTN_PUBLISH,
+    SAY_IDS.BTN_PUBLISH_SILENT,
+    SAY_IDS.BTN_PUBLISH_MENTION,
     SAY_IDS.BTN_TEST,
     SAY_IDS.BTN_EDIT_BASIC,
     SAY_IDS.BTN_EDIT_MEDIA,
@@ -101,11 +124,17 @@ function buildEmbedBasicEditModal(prefill = {}) {
 }
 
 async function handleSayComponents(interaction) {
-  // Channel select
-  if (interaction.isChannelSelectMenu() && interaction.customId === SAY_IDS.SELECT_CHANNEL) {
+  /* ===================== CHANNEL SELECT ===================== */
+  if (
+    interaction.isChannelSelectMenu() &&
+    interaction.customId === SAY_IDS.SELECT_CHANNEL
+  ) {
     try {
       if (!(await isStaff(interaction.member))) {
-        await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+        await interaction.reply({
+          content: "❌ Réservé au staff.",
+          flags: EPHEMERAL,
+        });
         return true;
       }
 
@@ -118,7 +147,10 @@ async function handleSayComponents(interaction) {
         return true;
       }
       if (draft.ownerId !== interaction.user.id) {
-        await interaction.reply({ content: "❌ Ce brouillon ne t’appartient pas.", flags: EPHEMERAL });
+        await interaction.reply({
+          content: "❌ Ce brouillon ne t’appartient pas.",
+          flags: EPHEMERAL,
+        });
         return true;
       }
 
@@ -126,7 +158,10 @@ async function handleSayComponents(interaction) {
       patchSayDraft(interaction.guildId, interaction.user.id, { channelId });
 
       const next = getSayDraft(interaction.guildId, interaction.user.id);
-      const payload = buildStudioPreviewPayload(next, `Salon cible défini sur ${channelId ? `<#${channelId}>` : "—"}.`);
+      const payload = buildStudioPreviewPayload(
+        next,
+        `Salon cible défini sur ${channelId ? `<#${channelId}>` : "—"}.`
+      );
 
       // IMPORTANT: pas de flags dans update()
       await interaction.update(payload);
@@ -134,13 +169,18 @@ async function handleSayComponents(interaction) {
     } catch (e) {
       console.error("handleSayComponents channelSelect error:", e);
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "❌ Erreur interne (Select).", flags: EPHEMERAL }).catch(() => {});
+        await interaction
+          .reply({
+            content: "❌ Erreur interne (Select).",
+            flags: EPHEMERAL,
+          })
+          .catch(() => {});
       }
       return true;
     }
   }
 
-  // Buttons
+  /* ===================== BUTTONS ===================== */
   if (!interaction.isButton()) return false;
   if (!isSayButtonId(interaction.customId)) return false;
 
@@ -162,19 +202,27 @@ async function handleSayComponents(interaction) {
       return true;
     }
     if (draft.ownerId !== userId) {
-      await interaction.reply({ content: "❌ Ce brouillon ne t’appartient pas.", flags: EPHEMERAL });
+      await interaction.reply({
+        content: "❌ Ce brouillon ne t’appartient pas.",
+        flags: EPHEMERAL,
+      });
       return true;
     }
 
-    // Toggle mentions
+    /* ===== Toggle mentions ===== */
     if (interaction.customId === SAY_IDS.BTN_TOGGLE_MENTIONS) {
-      const next = patchSayDraft(guildId, userId, { allowMentions: !draft.allowMentions });
-      const payload = buildStudioPreviewPayload(next, next.allowMentions ? "Mentions activées." : "Mentions bloquées.");
+      const next = patchSayDraft(guildId, userId, {
+        allowMentions: !draft.allowMentions,
+      });
+      const payload = buildStudioPreviewPayload(
+        next,
+        next.allowMentions ? "Mentions activées." : "Mentions bloquées."
+      );
       await interaction.update(payload);
       return true;
     }
 
-    // Cancel
+    /* ===== Cancel ===== */
     if (interaction.customId === SAY_IDS.BTN_CANCEL) {
       clearSayDraft(guildId, userId);
       await interaction.update({
@@ -189,22 +237,26 @@ async function handleSayComponents(interaction) {
       return true;
     }
 
-    // Edit basic
+    /* ===== Edit basic ===== */
     if (interaction.customId === SAY_IDS.BTN_EDIT_BASIC) {
       if (draft.type === "text") {
-        await interaction.showModal(buildTextEditModal({ content: draft.text?.content || "" }));
+        await interaction.showModal(
+          buildTextEditModal({ content: draft.text?.content || "" })
+        );
         return true;
       }
-
       const pre = draft.meta?.basic || {};
       await interaction.showModal(buildEmbedBasicEditModal(pre));
       return true;
     }
 
-    // Edit media
+    /* ===== Edit media ===== */
     if (interaction.customId === SAY_IDS.BTN_EDIT_MEDIA) {
       if (draft.type !== "embed") {
-        await interaction.reply({ content: "❌ Media est dispo uniquement pour un embed.", flags: EPHEMERAL });
+        await interaction.reply({
+          content: "❌ Media est dispo uniquement pour un embed.",
+          flags: EPHEMERAL,
+        });
         return true;
       }
       const pre = draft.meta?.media || {};
@@ -212,15 +264,29 @@ async function handleSayComponents(interaction) {
       return true;
     }
 
-    // Edit actions (buttons)
+    /* ===== Edit actions ===== */
     if (interaction.customId === SAY_IDS.BTN_EDIT_ACTIONS) {
       const pre = draft.meta?.actions || {};
       await interaction.showModal(buildActionsModal(pre));
       return true;
     }
 
-    // Test / Publish
-    if (interaction.customId === SAY_IDS.BTN_TEST || interaction.customId === SAY_IDS.BTN_PUBLISH) {
+    /* ===== Test / Publish variants ===== */
+    const isTest = interaction.customId === SAY_IDS.BTN_TEST;
+    const isPublish = interaction.customId === SAY_IDS.BTN_PUBLISH;
+    const isPublishSilent = interaction.customId === SAY_IDS.BTN_PUBLISH_SILENT;
+    const isPublishMention = interaction.customId === SAY_IDS.BTN_PUBLISH_MENTION;
+
+    if (isTest || isPublish || isPublishSilent || isPublishMention) {
+      // Cooldown anti spam
+      if (isOnCooldown(userId)) {
+        await interaction.reply({
+          content: "⏳ Doucement. Réessaie dans quelques secondes.",
+          flags: EPHEMERAL,
+        });
+        return true;
+      }
+
       const targetId = draft.channelId || interaction.channelId;
       const channel = await interaction.guild.channels.fetch(targetId).catch(() => null);
 
@@ -234,18 +300,63 @@ async function handleSayComponents(interaction) {
 
       const outbound = buildOutboundPayloadFromDraft(draft);
 
-      // Envoyer
+      // 🔕 silencieux -> aucun ping
+      if (isPublishSilent) {
+        outbound.allowedMentions = { parse: [] };
+      }
+
+      // 🔔 publish mention -> seulement si allowMentions ON
+      if (isPublishMention) {
+        if (!draft.allowMentions) {
+          await interaction.reply({
+            content:
+              "❌ Mentions désactivées sur ce draft. Active-les avec le bouton « Mentions ».",
+            flags: EPHEMERAL,
+          });
+          return true;
+        }
+
+        // @here/@everyone : permission obligatoire
+        const content = outbound.content || "";
+        if (containsEveryonePing(content)) {
+          const canEveryone = interaction.memberPermissions?.has?.(
+            PermissionsBitField.Flags.MentionEveryone
+          );
+          if (!canEveryone) {
+            await interaction.reply({
+              content:
+                "⛔ Tu n’as pas la permission d’utiliser `@here` / `@everyone`.",
+              flags: EPHEMERAL,
+            });
+            return true;
+          }
+          // autorise everyone si permission OK
+          outbound.allowedMentions = outbound.allowedMentions || {};
+          outbound.allowedMentions.parse = Array.from(
+            new Set([...(outbound.allowedMentions.parse || []), "everyone"])
+          );
+        }
+      }
+
+      // Envoi
       const sent = await channel.send(outbound);
 
-      if (interaction.customId === SAY_IDS.BTN_PUBLISH) {
+      // Publish = on clear le draft et on remplace la preview
+      if (isPublish || isPublishSilent || isPublishMention) {
         clearSayDraft(guildId, userId);
 
-        // update preview sans flags
         await interaction.update({
           embeds: [
             {
               title: "✅ Publié",
-              description: `Message publié dans <#${channel.id}>.\nID: \`${sent.id}\``,
+              description:
+                `Message publié dans <#${channel.id}>.\n` +
+                `ID: \`${sent.id}\`\n` +
+                (isPublishSilent
+                  ? "Mode : 🔕 **Silencieux**"
+                  : isPublishMention
+                  ? "Mode : 🔔 **Mentions**"
+                  : "Mode : ✅ **Standard**"),
             },
           ],
           components: [],
@@ -255,7 +366,10 @@ async function handleSayComponents(interaction) {
       }
 
       // TEST: on garde le draft
-      const payload = buildStudioPreviewPayload(draft, `Test envoyé dans <#${channel.id}> (ID: \`${sent.id}\`).`);
+      const payload = buildStudioPreviewPayload(
+        draft,
+        `Test envoyé dans <#${channel.id}> (ID: \`${sent.id}\`).`
+      );
       await interaction.update(payload);
       return true;
     }
@@ -264,7 +378,9 @@ async function handleSayComponents(interaction) {
   } catch (e) {
     console.error("handleSayComponents button error:", e);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: "❌ Erreur interne (Say Buttons).", flags: EPHEMERAL }).catch(() => {});
+      await interaction
+        .reply({ content: "❌ Erreur interne (Say Buttons).", flags: EPHEMERAL })
+        .catch(() => {});
     }
     return true;
   }

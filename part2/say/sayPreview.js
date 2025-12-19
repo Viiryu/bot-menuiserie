@@ -42,8 +42,11 @@ function isValidHttpUrl(url) {
 
 function buildOutboundPayloadFromDraft(draft) {
   const allowMentions = draft.allowMentions === true;
+
+  // SAFE par défaut : users/roles uniquement (pas everyone).
+  // (Le “everyone” peut être autorisé côté sayComponents.js si permission OK.)
   const allowedMentions = allowMentions
-    ? { parse: ["users", "roles", "everyone"] }
+    ? { parse: ["users", "roles"] }
     : { parse: [] };
 
   const components = [];
@@ -82,41 +85,38 @@ function buildControlEmbed(draft, statusText = null) {
   const createdAt = draft.meta?.createdAt ? new Date(draft.meta.createdAt) : null;
   const updatedAt = draft.meta?.updatedAt ? new Date(draft.meta.updatedAt) : null;
 
+  const typeLabel = draft.type === "embed" ? "🧩 Embed" : "📝 Texte";
+  const mentionLabel = draft.allowMentions ? "✅ Autorisées" : "❌ Bloquées";
+  const channelLabel = formatChannelMention(draft.channelId);
+
+  const btnCount = Array.isArray(draft.buttons)
+    ? draft.buttons.filter((b) => b?.label && b?.url && isValidHttpUrl(b.url)).length
+    : 0;
+
   const e = new EmbedBuilder()
     .setTitle("🧪 Studio /say — Aperçu premium")
     .setDescription(
       [
-        "Tu peux **prévisualiser**, **modifier**, **tester** et **publier** — sans spam ni commandes inutiles.",
-        "",
-        statusText ? `**Statut :** ${statusText}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n")
+        "Prévisualise, modifie, teste et publie **sans spam**.",
+        statusText ? `\n**Statut :** ${statusText}` : "",
+      ].join("\n")
     )
     .addFields(
+      { name: "🎯 Salon cible", value: channelLabel, inline: true },
+      { name: "🔔 Mentions", value: mentionLabel, inline: true },
+      { name: "🧩 Type", value: typeLabel, inline: true },
       {
-        name: "🎯 Salon cible",
-        value: formatChannelMention(draft.channelId),
+        name: "🔗 Boutons lien",
+        value: btnCount > 0 ? `✅ ${btnCount} bouton(s)` : "—",
         inline: true,
       },
       {
-        name: "🔔 Mentions",
-        value: draft.allowMentions ? "✅ Autorisées" : "❌ Bloquées",
-        inline: true,
-      },
-      {
-        name: "🧩 Type",
-        value: draft.type === "embed" ? "Embed" : "Texte",
+        name: "🚀 Modes de publication",
+        value:
+          "✅ **Publier** (standard)\n🔕 **Silent** (zéro ping)\n🔔 **Mention** (si Mentions ON)",
         inline: true,
       }
     );
-
-  const btnCount = Array.isArray(draft.buttons) ? draft.buttons.filter(b => b?.label && b?.url).length : 0;
-  e.addFields({
-    name: "🔗 Boutons lien",
-    value: btnCount > 0 ? `✅ ${btnCount} bouton(s)` : "—",
-    inline: true,
-  });
 
   if (createdAt || updatedAt) {
     e.setFooter({
@@ -152,7 +152,7 @@ function buildContentPreviewEmbed(draft) {
 }
 
 function buildStudioComponents(draft) {
-  // Row 1
+  // Row 1 (publish/test)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(SAY_IDS.BTN_PUBLISH)
@@ -160,15 +160,20 @@ function buildStudioComponents(draft) {
       .setEmoji("✅")
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
+      .setCustomId(SAY_IDS.BTN_PUBLISH_SILENT)
+      .setLabel("Silent")
+      .setEmoji("🔕")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(SAY_IDS.BTN_PUBLISH_MENTION)
+      .setLabel("Mention")
+      .setEmoji("🔔")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
       .setCustomId(SAY_IDS.BTN_TEST)
       .setLabel("Test")
       .setEmoji("🧪")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(SAY_IDS.BTN_TOGGLE_MENTIONS)
-      .setLabel(draft.allowMentions ? "Mentions: ON" : "Mentions: OFF")
-      .setEmoji("🔔")
-      .setStyle(draft.allowMentions ? ButtonStyle.Secondary : ButtonStyle.Secondary),
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(SAY_IDS.BTN_CANCEL)
       .setLabel("Annuler")
@@ -176,8 +181,13 @@ function buildStudioComponents(draft) {
       .setStyle(ButtonStyle.Danger)
   );
 
-  // Row 2 (edit)
+  // Row 2 (edit + toggles)
   const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(SAY_IDS.BTN_TOGGLE_MENTIONS)
+      .setLabel(draft.allowMentions ? "Mentions: ON" : "Mentions: OFF")
+      .setEmoji("🔔")
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(SAY_IDS.BTN_EDIT_BASIC)
       .setLabel("Modifier")

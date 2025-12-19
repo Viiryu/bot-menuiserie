@@ -1,40 +1,73 @@
-// part2/index.js — routing Part2 (schedule + /say studio + modération/comm)
-// NOTE: On garde Part2 léger : pas de /studio séparés (tout passe par /say).
-
+// part2/index.js
 const { startCacheGC } = require("./messageCache");
 const { registerMessageLogs } = require("./events/messageLogs");
 const { findCommand } = require("./commands");
 
+// Schedule
 const { startScheduler } = require("./scheduler/schedulerRunner");
 const { handleScheduleModals } = require("./modals/scheduleModals");
 const { handleScheduleUIInteraction } = require("./scheduler/schedulerUI");
 
-// ✅ /say
+// Say
 const { handleSayModals } = require("./modals/sayModals");
 const { handleSayComponents } = require("./components/sayComponents");
 
+// Autorole
+const { loadAutorolesFromDisk } = require("./autorole/autoroleState");
+const { handleAutoroleInteraction } = require("./autorole/autoroleUI");
+const { handleAutoroleComponents } = require("./autorole/autoroleComponents");
+
+// (optionnel) autocomplete presets /say
+let handleSayPresetAutocomplete = null;
+try {
+  ({ handleSayPresetAutocomplete } = require("./autocomplete/sayPresetAutocomplete"));
+} catch {}
+
+/**
+ * Register Part2 services
+ */
 function registerPart2(client) {
   const { loadSchedulesFromDisk } = require("./scheduler/schedulerState");
+
   startCacheGC();
   loadSchedulesFromDisk();
+  loadAutorolesFromDisk();
+
   startScheduler(client);
   registerMessageLogs(client);
 }
 
+/**
+ * Global interaction router for Part2
+ */
 async function handlePart2Interaction(interaction) {
-  // 1) /say (modals + components)
-  if (await handleSayModals(interaction)) return true;
-  if (await handleSayComponents(interaction)) return true;
+  // 0) Autocomplete (si présent)
+  if (interaction.isAutocomplete?.() && handleSayPresetAutocomplete) {
+    if (await handleSayPresetAutocomplete(interaction)) return true;
+  }
 
-  // 2) /schedule (UI + modals)
+  // 1) Autorole (menus/boutons publics + wizard UI)
+  if (await handleAutoroleComponents(interaction)) return true;
+  if (await handleAutoroleInteraction(interaction)) return true;
+
+  // 2) Say (select/boutons + modals)
+  if (await handleSayComponents(interaction)) return true;
+  if (await handleSayModals(interaction)) return true;
+
+  // 3) Schedule (UI + modals)
   if (await handleScheduleUIInteraction(interaction)) return true;
   if (await handleScheduleModals(interaction)) return true;
 
-  // 3) Slash commands Part2
-  if (interaction.isChatInputCommand && interaction.isChatInputCommand()) {
+  // 4) Slash commands Part2
+  if (interaction.isChatInputCommand?.() && interaction.isChatInputCommand()) {
     const cmd = findCommand(interaction.commandName);
     if (!cmd) return false;
-    await cmd.run(interaction);
+
+    // compat: certains exportent run, d’autres execute
+    const fn = cmd.run || cmd.execute;
+    if (!fn) return false;
+
+    await fn(interaction);
     return true;
   }
 
