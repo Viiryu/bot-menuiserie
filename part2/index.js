@@ -17,6 +17,12 @@ const { loadAutorolesFromDisk } = require("./autorole/autoroleState");
 const { handleAutoroleInteraction } = require("./autorole/autoroleUI");
 const { handleAutoroleComponents } = require("./autorole/autoroleComponents");
 
+// Staff (NEW)
+const { loadStaffConfig } = require("./staff/staffConfigState");
+const { handleStaffComponents } = require("./staff/staffComponents");
+const { handleStaffModals } = require("./staff/staffModals");
+const { handleStaffModerationModals } = require("./staff/staffModerationModals");
+
 // (optionnel) autocomplete presets /say
 let handleSayPresetAutocomplete = null;
 try {
@@ -32,6 +38,7 @@ function registerPart2(client) {
   startCacheGC();
   loadSchedulesFromDisk();
   loadAutorolesFromDisk();
+  loadStaffConfig();
 
   startScheduler(client);
   registerMessageLogs(client);
@@ -46,19 +53,24 @@ async function handlePart2Interaction(interaction) {
     if (await handleSayPresetAutocomplete(interaction)) return true;
   }
 
-  // 1) Autorole (menus/boutons publics + wizard UI)
+  // 1) Staff UI (buttons/selects) + modals
+  if (await handleStaffComponents(interaction)) return true;
+  if (await handleStaffModerationModals(interaction)) return true;
+  if (await handleStaffModals(interaction)) return true;
+
+  // 2) Autorole (menus/boutons publics + wizard UI)
   if (await handleAutoroleComponents(interaction)) return true;
   if (await handleAutoroleInteraction(interaction)) return true;
 
-  // 2) Say (select/boutons + modals)
+  // 3) Say (select/boutons + modals)
   if (await handleSayComponents(interaction)) return true;
   if (await handleSayModals(interaction)) return true;
 
-  // 3) Schedule (UI + modals)
+  // 4) Schedule (UI + modals)
   if (await handleScheduleUIInteraction(interaction)) return true;
   if (await handleScheduleModals(interaction)) return true;
 
-  // 4) Slash commands Part2
+  // 5) Slash commands Part2
   if (interaction.isChatInputCommand?.() && interaction.isChatInputCommand()) {
     const cmd = findCommand(interaction.commandName);
     if (!cmd) return false;

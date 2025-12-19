@@ -6,40 +6,73 @@ const {
   ButtonStyle,
   ChannelSelectMenuBuilder,
   RoleSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ChannelType,
   MessageFlagsBitField,
 } = require("discord.js");
 
 const { AUTOROLE_IDS } = require("./ids");
 const { isStaff } = require("../permissions");
-const {
-  setPending,
-  getPending,
-  clearPending,
-  upsertAutoroleMessage,
-  getAutoroleMessage,
-} = require("./autoroleState");
+const { setPending, getPending, clearPending, patchPending, upsertAutoroleMessage } = require("./autoroleState");
 
 const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
 
+function parseHexColorSafe(hex, fallback = 0xCBA135) {
+  const s = String(hex || "").trim().replace(/^0x/i, "#");
+  const m = s.match(/^#?([0-9a-fA-F]{6})$/);
+  if (!m) return fallback;
+  return parseInt(m[1], 16);
+}
+
+function clamp(s, n) {
+  const str = String(s ?? "");
+  return str.length > n ? str.slice(0, n - 1) + "…" : str;
+}
+
+function msToHuman(ms) {
+  const m = Math.max(1, Math.round((Number(ms) || 0) / 60000));
+  if (m < 60) return `${m} min`;
+  const h = Math.round(m / 60);
+  return `${h} h`;
+}
+
 function buildWizardEmbed(draft, statusText = null) {
-  const modeLabel = draft.mode === "add" ? "➕ Add-only" : "🔁 Toggle (add/remove)";
   const rolesCount = Array.isArray(draft.roleIds) ? draft.roleIds.length : 0;
+  const modeLabel = draft.mode === "add" ? "➕ Add-only" : "🔁 Toggle (add/remove)";
+  const multiLabel = draft.multi ? "✅ Multi" : "☑️ Mono";
+  const replLabel = draft.remplacement ? "✅ Remplacement" : "❌ Remplacement";
+  const tmpLabel = draft.temporary ? `⏳ Temporaire (${msToHuman(draft.durationMs)})` : "♾️ Définitif";
 
   const e = new EmbedBuilder()
-    .setTitle("🎭 Autorole — Création (Wizard)")
+    .setColor(parseHexColorSafe(draft.color))
+    .setTitle("🎛️ Autorole — Wizard premium")
     .setDescription(
       [
-        "Choisis des rôles, un salon, puis **Publier**.",
-        "Les membres utiliseront un menu pour recevoir (ou retirer) le rôle.",
+        "Configure ton menu d’auto-rôles **sans texte** : sélecteurs + boutons + modals.",
         "",
         statusText ? `**Statut :** ${statusText}` : null,
       ].filter(Boolean).join("\n")
     )
     .addFields(
-      { name: "🎯 Salon cible", value: draft.channelId ? `<#${draft.channelId}>` : "—", inline: true },
-      { name: "⚙️ Mode", value: modeLabel, inline: true },
+      { name: "📌 Salon cible", value: draft.channelId ? `<#${draft.channelId}>` : "—", inline: true },
       { name: "🧩 Rôles", value: rolesCount ? `✅ ${rolesCount} rôle(s)` : "—", inline: true },
+      { name: "⚙️ Mode", value: modeLabel, inline: true },
+
+      { name: "👥 Sélection", value: multiLabel, inline: true },
+      { name: "🔁 Remplacement", value: replLabel, inline: true },
+      { name: "⏳ Durée", value: tmpLabel, inline: true },
+
+      {
+        name: "🎨 Style (embed)",
+        value: [
+          `**Titre :** ${clamp(draft.title || "—", 80)}`,
+          `**Placeholder :** ${clamp(draft.placeholder || "—", 80)}`,
+          `**Couleur :** \`${draft.color || "—"}\``,
+        ].join("\n"),
+        inline: false,
+      }
     )
     .setFooter({ text: "Astuce: le bot doit avoir Manage Roles + être au-dessus des rôles." })
     .setTimestamp(new Date());
@@ -48,19 +81,26 @@ function buildWizardEmbed(draft, statusText = null) {
 }
 
 function buildPublicEmbed(config) {
+  const color = parseHexColorSafe(config.color);
   const modeLabel = config.mode === "add" ? "➕ Add-only" : "🔁 Toggle (add/remove)";
+  const multiLabel = config.multi ? "Multi" : "Mono";
+  const replLabel = config.remplacement ? "Remplacement" : "Sans remplacement";
+  const tmpLabel = config.temporary ? `⏳ Temporaire (${msToHuman(config.durationMs)})` : "♾️ Définitif";
+
   return new EmbedBuilder()
-    .setTitle("🎭 Autoroles")
+    .setColor(color)
+    .setTitle(config.title || "🎭 Autoroles")
     .setDescription(
       [
-        "Sélectionne un rôle dans le menu pour te l’attribuer.",
-        config.mode === "toggle"
-          ? "➡️ Si tu l’as déjà, il sera **retiré** (toggle)."
-          : "➡️ Add-only : tu peux **ajouter**, pas retirer via le menu.",
+        config.description || "",
         "",
         `**Mode :** ${modeLabel}`,
-      ].join("\n")
+        `**Sélection :** ${multiLabel}`,
+        `**Comportement :** ${replLabel}`,
+        `**Durée :** ${tmpLabel}`,
+      ].filter(Boolean).join("\n")
     )
+    .setFooter({ text: config.footer || "Auto-rôles" })
     .setTimestamp(new Date());
 }
 
@@ -87,6 +127,42 @@ function buildWizardComponents(draft) {
       .setLabel(draft.mode === "add" ? "Mode: Add-only" : "Mode: Toggle")
       .setEmoji("⚙️")
       .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId(AUTOROLE_IDS.WIZ_TOGGLE_MULTI)
+      .setLabel(draft.multi ? "Multi: ON" : "Multi: OFF")
+      .setEmoji("👥")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId(AUTOROLE_IDS.WIZ_TOGGLE_REPLACEMENT)
+      .setLabel(draft.remplacement ? "Remplacement: ON" : "Remplacement: OFF")
+      .setEmoji("🔁")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row4 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(AUTOROLE_IDS.WIZ_TOGGLE_TEMP)
+      .setLabel(draft.temporary ? "Temporaire: ON" : "Temporaire: OFF")
+      .setEmoji("⏳")
+      .setStyle(draft.temporary ? ButtonStyle.Primary : ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId(AUTOROLE_IDS.WIZ_EDIT_DURATION)
+      .setLabel("Durée…")
+      .setEmoji("🕒")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!draft.temporary),
+
+    new ButtonBuilder()
+      .setCustomId(AUTOROLE_IDS.WIZ_EDIT_STYLE)
+      .setLabel("Style (embed)…")
+      .setEmoji("🎨")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row5 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(AUTOROLE_IDS.WIZ_PUBLISH)
       .setLabel("Publier")
@@ -99,179 +175,131 @@ function buildWizardComponents(draft) {
       .setStyle(ButtonStyle.Danger)
   );
 
-  return [row1, row2, row3];
+  return [row1, row2, row3, row4, row5];
 }
 
 function buildPublicComponents(config) {
-  const ids = Array.isArray(config.roleIds) ? config.roleIds.slice(0, 25) : [];
-  const max = Math.max(1, Math.min(25, ids.length));
+  const max = config.multi ? Math.max(1, Math.min(25, (config.roleIds || []).length)) : 1;
 
   const menu = new RoleSelectMenuBuilder()
     .setCustomId(AUTOROLE_IDS.PUBLIC_MENU)
-    .setPlaceholder("🎭 Choisir ton/tes rôle(s)…")
+    .setPlaceholder(clamp(config.placeholder || "Choisir un rôle…", 100))
     .setMinValues(1)
     .setMaxValues(max);
 
   return [new ActionRowBuilder().addComponents(menu)];
 }
 
+function buildWizardPayload(draft, statusText) {
+  return {
+    embeds: [buildWizardEmbed(draft, statusText)],
+    components: buildWizardComponents(draft),
+  };
+}
+
+// ========================= WIZARD HANDLER =========================
 async function handleAutoroleInteraction(interaction) {
-  // PUBLIC: members selecting roles
-  if (interaction.isRoleSelectMenu && interaction.isRoleSelectMenu()) {
-    if (interaction.customId !== AUTOROLE_IDS.PUBLIC_MENU) return false;
-
-    try {
-      const guildId = interaction.guildId;
-      const messageId = interaction.message?.id;
-      if (!guildId || !messageId) return false;
-
-      const config = getAutoroleMessage(guildId, messageId);
-      if (!config) {
-        await interaction.reply({ content: "⚠️ Autorole non configuré (config introuvable).", flags: EPHEMERAL });
-        return true;
-      }
-
-      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (!member) {
-        await interaction.reply({ content: "❌ Impossible de récupérer ton profil serveur.", flags: EPHEMERAL });
-        return true;
-      }
-
-      const me = interaction.guild.members.me || (await interaction.guild.members.fetchMe().catch(() => null));
-      if (!me?.permissions?.has?.("ManageRoles")) {
-        await interaction.reply({ content: "❌ Le bot n’a pas la permission **Manage Roles**.", flags: EPHEMERAL });
-        return true;
-      }
-
-      const allowed = new Set((config.roleIds || []).map(String));
-      const picked = (interaction.values || []).map(String).filter((id) => allowed.has(id));
-
-      if (!picked.length) {
-        await interaction.reply({ content: "❌ Rôle non autorisé pour ce menu.", flags: EPHEMERAL });
-        return true;
-      }
-
-      const added = [];
-      const removed = [];
-      const failed = [];
-
-      for (const roleId of picked) {
-        const role = interaction.guild.roles.cache.get(roleId);
-        if (!role) {
-          failed.push(roleId);
-          continue;
-        }
-
-        // Le bot doit être au-dessus du rôle
-        if (me.roles.highest.comparePositionTo(role) <= 0) {
-          failed.push(`${role.name} (position)`);
-          continue;
-        }
-
-        try {
-          const has = member.roles.cache.has(roleId);
-
-          if (config.mode === "add") {
-            if (!has) {
-              await member.roles.add(roleId, "Autorole menu");
-              added.push(role.name);
-            }
-          } else {
-            // toggle
-            if (has) {
-              await member.roles.remove(roleId, "Autorole menu");
-              removed.push(role.name);
-            } else {
-              await member.roles.add(roleId, "Autorole menu");
-              added.push(role.name);
-            }
-          }
-        } catch (e) {
-          failed.push(role.name);
-        }
-      }
-
-      const lines = [];
-      if (added.length) lines.push(`✅ Ajouté: **${added.join(", ")}**`);
-      if (removed.length) lines.push(`➖ Retiré: **${removed.join(", ")}**`);
-      if (failed.length) lines.push(`⚠️ Échec: **${failed.join(", ")}**`);
-
-      await interaction.reply({
-        content: lines.length ? lines.join("\n") : "✅ OK.",
-        flags: EPHEMERAL,
-      });
-
-      return true;
-    } catch (e) {
-      console.error("[autorole] public menu error:", e);
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "❌ Erreur interne (Autorole).", flags: EPHEMERAL }).catch(() => {});
-      }
-      return true;
-    }
-  }
-
-  // WIZARD: staff selecting roles
-  if (interaction.isRoleSelectMenu && interaction.isRoleSelectMenu()) {
-    if (interaction.customId !== AUTOROLE_IDS.WIZ_ROLE_SELECT) return false;
-
-    if (!(await isStaff(interaction.member))) {
-      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
-      return true;
-    }
-
-    const draft = getPending(interaction.guildId, interaction.user.id);
-    if (!draft) {
-      await interaction.reply({ content: "❌ Wizard expiré. Relance `/autorole create`.", flags: EPHEMERAL });
-      return true;
-    }
-
-    draft.roleIds = (interaction.values || []).map(String).slice(0, 25);
-    draft.updatedAt = Date.now();
-    setPending(interaction.guildId, interaction.user.id, draft);
-
-    const payload = {
-      embeds: [buildWizardEmbed(draft, "Rôles mis à jour.")],
-      components: buildWizardComponents(draft),
-    };
-
-    // IMPORTANT: pas de flags dans update()
-    await interaction.update(payload);
-    return true;
-  }
-
-  // WIZARD: staff selecting channel
-  if (interaction.isChannelSelectMenu && interaction.isChannelSelectMenu()) {
-    if (interaction.customId !== AUTOROLE_IDS.WIZ_CHANNEL_SELECT) return false;
-
-    if (!(await isStaff(interaction.member))) {
-      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
-      return true;
-    }
-
-    const draft = getPending(interaction.guildId, interaction.user.id);
-    if (!draft) {
-      await interaction.reply({ content: "❌ Wizard expiré. Relance `/autorole create`.", flags: EPHEMERAL });
-      return true;
-    }
-
-    draft.channelId = interaction.values?.[0] || null;
-    draft.updatedAt = Date.now();
-    setPending(interaction.guildId, interaction.user.id, draft);
-
-    await interaction.update({
-      embeds: [buildWizardEmbed(draft, "Salon cible mis à jour.")],
-      components: buildWizardComponents(draft),
-    });
-    return true;
-  }
-
-  // WIZARD: buttons
-  if (interaction.isButton && interaction.isButton()) {
-    const id = interaction.customId;
-    if (![AUTOROLE_IDS.WIZ_TOGGLE_MODE, AUTOROLE_IDS.WIZ_PUBLISH, AUTOROLE_IDS.WIZ_CANCEL].includes(id)) {
+  // ====== MODALS ======
+  if (interaction.isModalSubmit?.()) {
+    if (interaction.customId !== AUTOROLE_IDS.MODAL_STYLE && interaction.customId !== AUTOROLE_IDS.MODAL_DURATION) {
       return false;
     }
+
+    if (!(await isStaff(interaction.member))) {
+      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const draft = getPending(interaction.guildId, interaction.user.id);
+    if (!draft) {
+      await interaction.reply({ content: "❌ Wizard expiré. Relance `/autorole create`.", flags: EPHEMERAL });
+      return true;
+    }
+
+    if (interaction.customId === AUTOROLE_IDS.MODAL_STYLE) {
+      const title = interaction.fields.getTextInputValue("title") || draft.title;
+      const description = interaction.fields.getTextInputValue("description") || draft.description;
+      const placeholder = interaction.fields.getTextInputValue("placeholder") || draft.placeholder;
+      const color = interaction.fields.getTextInputValue("color") || draft.color;
+      const footer = interaction.fields.getTextInputValue("footer") || draft.footer;
+
+      const next = patchPending(interaction.guildId, interaction.user.id, {
+        title: title.slice(0, 256),
+        description: description.slice(0, 4000),
+        placeholder: placeholder.slice(0, 100),
+        color: color.slice(0, 32),
+        footer: footer.slice(0, 2048),
+      });
+
+      await interaction.update(buildWizardPayload(next, "Style mis à jour."));
+      return true;
+    }
+
+    if (interaction.customId === AUTOROLE_IDS.MODAL_DURATION) {
+      const minutesRaw = interaction.fields.getTextInputValue("minutes");
+      const minutes = Math.max(1, Math.min(60 * 24 * 30, Number(minutesRaw || 60))); // 1 min -> 30 jours
+      const next = patchPending(interaction.guildId, interaction.user.id, { durationMs: minutes * 60 * 1000 });
+
+      await interaction.update(buildWizardPayload(next, "Durée mise à jour."));
+      return true;
+    }
+
+    return false;
+  }
+
+  // ====== WIZARD: selects ======
+  if (interaction.isRoleSelectMenu?.() && interaction.customId === AUTOROLE_IDS.WIZ_ROLE_SELECT) {
+    if (!(await isStaff(interaction.member))) {
+      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const draft = getPending(interaction.guildId, interaction.user.id);
+    if (!draft) {
+      await interaction.reply({ content: "❌ Wizard expiré. Relance `/autorole create`.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const roleIds = (interaction.values || []).map(String).slice(0, 25);
+    const next = patchPending(interaction.guildId, interaction.user.id, { roleIds });
+
+    await interaction.update(buildWizardPayload(next, "Rôles mis à jour."));
+    return true;
+  }
+
+  if (interaction.isChannelSelectMenu?.() && interaction.customId === AUTOROLE_IDS.WIZ_CHANNEL_SELECT) {
+    if (!(await isStaff(interaction.member))) {
+      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const draft = getPending(interaction.guildId, interaction.user.id);
+    if (!draft) {
+      await interaction.reply({ content: "❌ Wizard expiré. Relance `/autorole create`.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const channelId = interaction.values?.[0] || null;
+    const next = patchPending(interaction.guildId, interaction.user.id, { channelId });
+
+    await interaction.update(buildWizardPayload(next, "Salon cible mis à jour."));
+    return true;
+  }
+
+  // ====== WIZARD: buttons ======
+  if (interaction.isButton?.()) {
+    const id = interaction.customId;
+    const allowed = new Set([
+      AUTOROLE_IDS.WIZ_TOGGLE_MODE,
+      AUTOROLE_IDS.WIZ_TOGGLE_MULTI,
+      AUTOROLE_IDS.WIZ_TOGGLE_REPLACEMENT,
+      AUTOROLE_IDS.WIZ_TOGGLE_TEMP,
+      AUTOROLE_IDS.WIZ_EDIT_STYLE,
+      AUTOROLE_IDS.WIZ_EDIT_DURATION,
+      AUTOROLE_IDS.WIZ_PUBLISH,
+      AUTOROLE_IDS.WIZ_CANCEL,
+    ]);
+    if (!allowed.has(id)) return false;
 
     if (!(await isStaff(interaction.member))) {
       await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
@@ -294,18 +322,80 @@ async function handleAutoroleInteraction(interaction) {
     }
 
     if (id === AUTOROLE_IDS.WIZ_TOGGLE_MODE) {
-      draft.mode = draft.mode === "add" ? "toggle" : "add";
-      draft.updatedAt = Date.now();
-      setPending(interaction.guildId, interaction.user.id, draft);
-
-      await interaction.update({
-        embeds: [buildWizardEmbed(draft, "Mode changé.")],
-        components: buildWizardComponents(draft),
+      const next = patchPending(interaction.guildId, interaction.user.id, {
+        mode: draft.mode === "add" ? "toggle" : "add",
       });
+      await interaction.update(buildWizardPayload(next, "Mode changé."));
       return true;
     }
 
-    // Publish
+    if (id === AUTOROLE_IDS.WIZ_TOGGLE_MULTI) {
+      const next = patchPending(interaction.guildId, interaction.user.id, { multi: !draft.multi });
+      await interaction.update(buildWizardPayload(next, "Paramètre multi changé."));
+      return true;
+    }
+
+    if (id === AUTOROLE_IDS.WIZ_TOGGLE_REPLACEMENT) {
+      const next = patchPending(interaction.guildId, interaction.user.id, { remplacement: !draft.remplacement });
+      await interaction.update(buildWizardPayload(next, "Remplacement changé."));
+      return true;
+    }
+
+    if (id === AUTOROLE_IDS.WIZ_TOGGLE_TEMP) {
+      const next = patchPending(interaction.guildId, interaction.user.id, { temporary: !draft.temporary });
+      await interaction.update(buildWizardPayload(next, "Temporaire changé."));
+      return true;
+    }
+
+    if (id === AUTOROLE_IDS.WIZ_EDIT_STYLE) {
+      const modal = new ModalBuilder().setCustomId(AUTOROLE_IDS.MODAL_STYLE).setTitle("🎨 Style du menu");
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId("title").setLabel("Titre").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(256).setValue(String(draft.title || ""))
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId("description").setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(String(draft.description || ""))
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId("placeholder").setLabel("Placeholder du menu").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(100).setValue(String(draft.placeholder || ""))
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId("color").setLabel("Couleur HEX (#CBA135)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(32).setValue(String(draft.color || ""))
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId("footer").setLabel("Footer").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2048).setValue(String(draft.footer || ""))
+        )
+      );
+
+      await interaction.showModal(modal);
+      return true;
+    }
+
+    if (id === AUTOROLE_IDS.WIZ_EDIT_DURATION) {
+      if (!draft.temporary) {
+        await interaction.reply({ content: "⚠️ Active d’abord le mode **Temporaire**.", flags: EPHEMERAL });
+        return true;
+      }
+
+      const minutes = Math.max(1, Math.round((Number(draft.durationMs || 0) / 60000) || 60));
+
+      const modal = new ModalBuilder().setCustomId(AUTOROLE_IDS.MODAL_DURATION).setTitle("⏳ Durée (temporaire)");
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("minutes")
+            .setLabel("Durée en minutes (1 à 43200)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(String(minutes))
+        )
+      );
+
+      await interaction.showModal(modal);
+      return true;
+    }
+
     if (id === AUTOROLE_IDS.WIZ_PUBLISH) {
       if (!draft.channelId) {
         await interaction.reply({ content: "❌ Choisis un salon cible.", flags: EPHEMERAL });
@@ -317,7 +407,7 @@ async function handleAutoroleInteraction(interaction) {
       }
 
       const channel = await interaction.guild.channels.fetch(draft.channelId).catch(() => null);
-      if (!channel || !channel.isTextBased()) {
+      if (!channel || !channel.isTextBased?.()) {
         await interaction.reply({ content: "❌ Salon invalide.", flags: EPHEMERAL });
         return true;
       }
@@ -325,9 +415,21 @@ async function handleAutoroleInteraction(interaction) {
       const config = {
         channelId: draft.channelId,
         roleIds: draft.roleIds.slice(0, 25),
+
         mode: draft.mode || "toggle",
+        multi: !!draft.multi,
+        remplacement: !!draft.remplacement,
+        temporary: !!draft.temporary,
+        durationMs: Number(draft.durationMs || 0) || 0,
+
+        title: draft.title || "🎭 Autoroles",
+        description: draft.description || "",
+        placeholder: draft.placeholder || "Choisir un rôle…",
+        color: draft.color || "#CBA135",
+        footer: draft.footer || "Auto-rôles",
+
         createdBy: interaction.user.id,
-        createdAt: draft.createdAt || Date.now(),
+        createdAt: draft?.meta?.createdAt || Date.now(),
       };
 
       const msg = await channel.send({
@@ -339,12 +441,7 @@ async function handleAutoroleInteraction(interaction) {
       clearPending(interaction.guildId, interaction.user.id);
 
       await interaction.update({
-        embeds: [
-          {
-            title: "✅ Autorole publié",
-            description: `Publié dans <#${channel.id}>.\nID: \`${msg.id}\``,
-          },
-        ],
+        embeds: [{ title: "✅ Autorole publié", description: `Publié dans <#${channel.id}>.\nID: \`${msg.id}\`` }],
         components: [],
       });
 
@@ -355,8 +452,4 @@ async function handleAutoroleInteraction(interaction) {
   return false;
 }
 
-function startAutorole(client) {
-  // rien à scheduler, mais on expose une fonction si tu veux étendre
-}
-
-module.exports = { handleAutoroleInteraction, startAutorole };
+module.exports = { handleAutoroleInteraction, buildWizardPayload, buildPublicEmbed, buildPublicComponents };

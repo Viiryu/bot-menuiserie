@@ -5,21 +5,16 @@ const ban = require("./ban");
 const say = require("./say");
 const schedule = require("./schedule");
 const autorole = require("./autorole");
+const staff = require("./staff");
 
-const COMMANDS = [help, purge, ban, say, schedule, autorole];
+const COMMANDS = [help, purge, ban, say, schedule, autorole, staff];
 
-/**
- * Retourne le nom canonical de la commande :
- * - préférences: data.name (SlashCommandBuilder)
- * - fallback: name
- */
 function getCmdName(c) {
-  return c?.data?.name || c?.name || null;
+  return c?.data?.name || c?.name || c?.builder?.name || null;
 }
 
 function findCommand(name) {
-  const n = String(name || "").toLowerCase();
-  return COMMANDS.find((c) => String(getCmdName(c) || "").toLowerCase() === n);
+  return COMMANDS.find((c) => getCmdName(c) === name) || null;
 }
 
 module.exports = { COMMANDS, findCommand };

@@ -1,8 +1,9 @@
+// part2/autorole/autoroleComponents.js
 const { MessageFlagsBitField } = require("discord.js");
-const { getAutoroleMenu } = require("./autoroleState");
+const { AUTOROLE_IDS } = require("./ids");
+const { getAutoroleMessage } = require("./autoroleState");
 
 const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
-const AUTOROLE_CUSTOM_ID = "P2_AUTOROLE_MENU";
 
 function canManageRole(botMember, role) {
   if (!botMember?.permissions?.has?.("ManageRoles")) return false;
@@ -11,67 +12,106 @@ function canManageRole(botMember, role) {
 }
 
 async function handleAutoroleComponents(interaction) {
-  if (!interaction.isStringSelectMenu()) return false;
-  if (interaction.customId !== AUTOROLE_CUSTOM_ID) return false;
+  if (!interaction.isRoleSelectMenu?.()) return false;
+  if (interaction.customId !== AUTOROLE_IDS.PUBLIC_MENU) return false;
 
   try {
-    const menu = getAutoroleMenu(interaction.message.id);
-    if (!menu) {
+    const guild = interaction.guild;
+    if (!guild) return false;
+
+    const config = getAutoroleMessage(interaction.guildId, interaction.message.id);
+    if (!config) {
       await interaction.reply({ content: "⚠️ Ce menu auto-rôle n’est plus actif.", flags: EPHEMERAL });
       return true;
     }
 
-    const member = interaction.member; // GuildMember
-    const guild = interaction.guild;
-    if (!guild || !member) return false;
+    const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member) {
+      await interaction.reply({ content: "❌ Impossible de récupérer ton profil serveur.", flags: EPHEMERAL });
+      return true;
+    }
 
-    const botMember = await guild.members.fetchMe().catch(() => null);
+    const botMember = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     if (!botMember) {
       await interaction.reply({ content: "❌ Impossible: botMember introuvable.", flags: EPHEMERAL });
       return true;
     }
 
-    const selected = interaction.values || [];
-    const allowed = new Set(menu.roleIds || []);
+    if (!botMember.permissions?.has?.("ManageRoles")) {
+      await interaction.reply({ content: "❌ Le bot n’a pas la permission **Manage Roles**.", flags: EPHEMERAL });
+      return true;
+    }
 
-    // sécurité: si quelqu’un injecte autre chose
-    for (const rid of selected) {
-      if (!allowed.has(rid)) {
-        await interaction.reply({ content: "❌ Rôle non autorisé par ce menu.", flags: EPHEMERAL });
-        return true;
+    const allowed = new Set((config.roleIds || []).map(String));
+
+    // rôles sélectionnés (filtrés sécurité)
+    const picked = (interaction.values || []).map(String).filter((rid) => allowed.has(rid));
+    if (!picked.length) {
+      await interaction.reply({ content: "❌ Rôle non autorisé pour ce menu.", flags: EPHEMERAL });
+      return true;
+    }
+
+    const added = [];
+    const removed = [];
+    const failed = [];
+
+    // si remplacement: enlever tous les autres rôles autorisés non sélectionnés
+    if (config.remplacement) {
+      for (const rid of allowed) {
+        if (picked.includes(rid)) continue;
+        if (!member.roles.cache.has(rid)) continue;
+
+        const role = guild.roles.cache.get(rid);
+        if (!role) continue;
+        if (!canManageRole(botMember, role)) continue;
+
+        await member.roles.remove(rid, "Autorole: remplacement").catch(() => null);
       }
     }
 
-    const results = [];
-    for (const roleId of selected) {
+    for (const roleId of picked) {
       const role = guild.roles.cache.get(roleId);
       if (!role) {
-        results.push(`⚠️ Rôle introuvable: ${roleId}`);
+        failed.push(roleId);
         continue;
       }
 
       if (!canManageRole(botMember, role)) {
-        results.push(`⛔ Je ne peux pas gérer **${role.name}** (permissions / position du rôle).`);
+        failed.push(`${role.name} (permissions/position)`);
         continue;
       }
 
       const has = member.roles.cache.has(roleId);
-      if (has) {
-        await member.roles.remove(roleId).catch(() => null);
-        results.push(`➖ Retiré: **${role.name}**`);
+
+      if (config.mode === "add") {
+        if (!has) {
+          await member.roles.add(roleId, "Autorole menu").catch(() => null);
+          added.push(role.name);
+        }
       } else {
-        await member.roles.add(roleId).catch(() => null);
-        results.push(`➕ Ajouté: **${role.name}**`);
+        // toggle
+        if (has) {
+          await member.roles.remove(roleId, "Autorole menu").catch(() => null);
+          removed.push(role.name);
+        } else {
+          await member.roles.add(roleId, "Autorole menu").catch(() => null);
+          added.push(role.name);
+        }
       }
     }
 
-    if (results.length === 0) results.push("—");
+    const lines = [];
+    if (added.length) lines.push(`✅ Ajouté: **${added.join(", ")}**`);
+    if (removed.length) lines.push(`➖ Retiré: **${removed.join(", ")}**`);
+    if (failed.length) lines.push(`⚠️ Échec: **${failed.join(", ")}**`);
 
-    await interaction.reply({
-      content: `✅ Auto-rôle:\n${results.map((x) => `• ${x}`).join("\n")}`,
-      flags: EPHEMERAL,
-    });
+    // ⚠️ temporaire: ici on indique juste l’info (si tu veux timer persistant, je te le code aussi)
+    if (config.temporary && added.length) {
+      lines.push(`⏳ Temporaire activé: ces rôles sont prévus pour expirer (**${Math.round((config.durationMs || 0) / 60000)} min**).`);
+      // (Timer persistant à ajouter si tu veux, sinon c’est “best effort”)
+    }
 
+    await interaction.reply({ content: lines.length ? lines.join("\n") : "✅ OK.", flags: EPHEMERAL });
     return true;
   } catch (e) {
     console.error("[autoroleComponents] error:", e);
@@ -82,4 +122,4 @@ async function handleAutoroleComponents(interaction) {
   }
 }
 
-module.exports = { handleAutoroleComponents, AUTOROLE_CUSTOM_ID };
+module.exports = { handleAutoroleComponents };
