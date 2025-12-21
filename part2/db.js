@@ -1,25 +1,59 @@
-const { Pool } = require("pg");
+// part2/db.js — DB optional (no crash without pg)
+// If DATABASE_URL is set, we'll try to use Postgres via 'pg'.
+// Otherwise we fall back to a tiny in-memory/no-op driver so the bot runs everywhere.
 
-let pool;
+"use strict";
 
-function hasDb() {
+let _pool = null;
+
+function hasDatabaseUrl() {
   return !!process.env.DATABASE_URL;
 }
 
-function getPool() {
-  if (!hasDb()) return null;
-  if (!pool) {
-    pool = new Pool({ connectionString: process.env.DATABASE_URL });
+function getPgPool() {
+  if (_pool) return _pool;
+
+  let Pool;
+  try {
+    ({ Pool } = require("pg"));
+  } catch (e) {
+    // pg not installed -> cannot use DB mode
+    throw new Error(
+      "Module 'pg' manquant. Installe-le (npm i pg) OU retire DATABASE_URL de l'env."
+    );
   }
-  return pool;
+
+  _pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl:
+      String(process.env.PGSSL || "true").toLowerCase() === "true"
+        ? { rejectUnauthorized: false }
+        : undefined,
+  });
+
+  return _pool;
 }
 
-async function q(text, params) {
-  const p = getPool();
-  if (!p) {
-    throw new Error("NO_DB");
+/**
+ * query(sql, params)
+ * - In DB mode (DATABASE_URL): executes SQL
+ * - Otherwise: returns empty rows
+ */
+async function query(sql, params = []) {
+  if (!hasDatabaseUrl()) {
+    return { rows: [], rowCount: 0 };
   }
-  return p.query(text, params);
+
+  const pool = getPgPool();
+  const res = await pool.query(sql, params);
+  return res;
 }
 
-module.exports = { q, hasDb };
+async function close() {
+  try {
+    if (_pool) await _pool.end();
+  } catch {}
+  _pool = null;
+}
+
+module.exports = { query, close, hasDatabaseUrl };

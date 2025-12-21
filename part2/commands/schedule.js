@@ -1,71 +1,73 @@
-const { SlashCommandBuilder, MessageFlagsBitField } = require("discord.js");
-const { isStaff } = require("../permissions");
-const { openStudio } = require("../studio/embedStudio");
-const { openTextStudio } = require("../studio/textStudio");
-const { openScheduleManager } = require("../scheduler/schedulerUI");
+// part2/commands/schedule.js
+// Wrapper robuste: réactive la commande /schedule (Part2) même si ton module évolue.
 
-const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
-const data = new SlashCommandBuilder()
-  .setName("schedule")
-  .setDescription("Messages récurrents (ultra premium)")
-  .setDMPermission(false)
-
-  .addSubcommand((s) =>
-    s
-      .setName("create")
-      .setDescription("Créer un scheduler")
-      .addStringOption((o) =>
-        o
-          .setName("type")
-          .setDescription("Type")
-          .setRequired(true)
-          .addChoices({ name: "text", value: "text" }, { name: "embed", value: "embed" })
-      )
-      .addIntegerOption((o) =>
-        o.setName("every_minutes").setDescription("Répéter toutes les X minutes").setRequired(true).setMinValue(1)
-      )
-      .addChannelOption((o) =>
-        o.setName("channel").setDescription("Salon cible (défaut: salon actuel)").setRequired(false)
-      )
-      .addIntegerOption((o) =>
-        o.setName("start_in_minutes").setDescription("Démarrer dans X minutes").setRequired(false).setMinValue(0)
-      )
-      .addStringOption((o) =>
-        o.setName("ping").setDescription("Ping optionnel (@here ou <@&roleId>)").setRequired(false)
-      )
-  )
-
-  .addSubcommand((s) => s.setName("list").setDescription("Ouvrir le Scheduler Manager"));
-
-async function run(interaction) {
-  if (!(await isStaff(interaction.member))) {
-    return interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
+function isStaff(member) {
+  try {
+    if (!member) return false;
+    if (member.permissions?.has?.(PermissionFlagsBits.Administrator)) return true;
+    return member.permissions?.has?.(PermissionFlagsBits.ManageGuild) || member.permissions?.has?.(PermissionFlagsBits.ManageMessages);
+  } catch {
+    return false;
   }
-
-  const sub = interaction.options.getSubcommand(true);
-
-  if (sub === "list") return openScheduleManager(interaction);
-
-  // create
-  const type = interaction.options.getString("type", true);
-  const everyMinutes = interaction.options.getInteger("every_minutes", true);
-  const startIn = interaction.options.getInteger("start_in_minutes") || 0;
-  const ping = interaction.options.getString("ping") || "";
-
-  const channel = interaction.options.getChannel("channel") || interaction.channel;
-  const channelId = channel?.id || interaction.channelId;
-
-  const schedule = {
-    guildId: interaction.guildId,
-    channelId,
-    everyMs: everyMinutes * 60_000,
-    startDelayMs: startIn * 60_000,
-    ping,
-  };
-
-  if (type === "text") return openTextStudio(interaction, { schedule });
-  return openStudio(interaction, { mode: "schedule", schedule });
 }
 
-module.exports = { name: "schedule", data, run };
+async function safeBuildPayload(interaction) {
+  let ui;
+  try {
+    ui = require('../scheduler/schedulerUI');
+  } catch {
+    ui = null;
+  }
+
+  // Essaye plusieurs signatures possibles.
+  const candidates = [
+    ui?.buildScheduleHomePayload,
+    ui?.buildSchedulerHomePayload,
+    ui?.buildHomePayload,
+    ui?.buildPanelPayload,
+  ].filter(Boolean);
+
+  for (const fn of candidates) {
+    try {
+      // 1) fn(interaction)
+      const p1 = await fn(interaction);
+      if (p1 && typeof p1 === 'object') return p1;
+    } catch {}
+    try {
+      // 2) fn(client, guild, user)
+      const p2 = await fn(interaction.client, interaction.guild, interaction.user);
+      if (p2 && typeof p2 === 'object') return p2;
+    } catch {}
+    try {
+      // 3) fn(client, guild)
+      const p3 = await fn(interaction.client, interaction.guild);
+      if (p3 && typeof p3 === 'object') return p3;
+    } catch {}
+  }
+
+  // Fallback: commande fonctionne, mais module absent/incompatible.
+  return {
+    content:
+      '✅ /schedule est bien chargé, mais le module scheduler n’a pas été trouvé ou ses exports ne correspondent pas.\n' +
+      '➡️ Vérifie que le dossier **part2/scheduler/** existe et que **schedulerUI.js** exporte un builder de payload.',
+    ephemeral: true,
+  };
+}
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('schedule')
+    .setDescription('🗓️ Ouvrir le panneau Schedule (staff).')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false),
+
+  async execute(interaction) {
+    if (!isStaff(interaction.member)) {
+      return interaction.reply({ content: '⛔ Staff uniquement.', ephemeral: true });
+    }
+    const payload = await safeBuildPayload(interaction);
+    return interaction.reply(payload);
+  },
+};

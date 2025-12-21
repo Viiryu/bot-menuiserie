@@ -1,118 +1,68 @@
-// part2/commands/autorole.js
-const { SlashCommandBuilder, MessageFlagsBitField } = require("discord.js");
-const { isStaff } = require("../permissions");
+const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 
-const {
-  loadAutorolesFromDisk,
-  listAutoroleMessages,
-  removeAutoroleMessage,
-  setPending,
-} = require("../autorole/autoroleState");
+// Simple Autorole panel: pick roles from config file (part2/autorole/autoroleStore.json)
+// If the autorole system is not configured yet, it posts an explanatory message.
 
-const { buildWizardPayload } = require("../autorole/autoroleUI");
-
-const EPHEMERAL = MessageFlagsBitField.Flags.Ephemeral;
-
-function defaultDraft(guildId, userId) {
-  return {
-    guildId,
-    userId,
-
-    // target
-    channelId: null,
-    roleIds: [],
-
-    // behavior
-    mode: "toggle", // toggle | add
-    multi: true, // public menu max values > 1
-    remplacement: false, // si true: enlève les autres rôles autorisés non sélectionnés
-    temporary: false, // si true: le rôle expire
-    durationMs: 60 * 60 * 1000, // 1h par défaut
-
-    // style
-    title: "🎭 Autoroles",
-    description: "Sélectionne un rôle dans le menu ci-dessous.",
-    placeholder: "Choisir un rôle…",
-    color: "#CBA135",
-    footer: "Auto-rôles — Le Secrétaire",
-
-    meta: {
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    },
-  };
-}
-
-async function executeAutorole(interaction) {
+function safeReadJSON(filepath, fallback) {
   try {
-    if (!(await isStaff(interaction.member))) {
-      await interaction.reply({ content: "❌ Réservé au staff.", flags: EPHEMERAL });
-      return;
-    }
-
-    loadAutorolesFromDisk();
-
-    const sub = interaction.options.getSubcommand();
-
-    if (sub === "list") {
-      const items = listAutoroleMessages(interaction.guildId);
-
-      const lines = items.length
-        ? items
-            .map((x) => {
-              const m = x.mode === "add" ? "➕ add" : "🔁 toggle";
-              const multi = x.multi ? "multi" : "mono";
-              const repl = x.remplacement ? "remplacement" : "pas-remplacement";
-              const tmp = x.temporary ? `⏳ ${Math.round((x.durationMs || 0) / 60000)}m` : "♾️ définitif";
-              return `• <#${x.channelId}> — \`${x.messageId}\` — rôles:${x.roleIds?.length || 0} — ${m} — ${multi} — ${repl} — ${tmp}`;
-            })
-            .join("\n")
-        : "—";
-
-      await interaction.reply({ content: `📌 Menus autorole (store):\n${lines}`, flags: EPHEMERAL });
-      return;
-    }
-
-    if (sub === "delete") {
-      const messageId = interaction.options.getString("message_id", true);
-      const removed = removeAutoroleMessage(interaction.guildId, messageId);
-
-      await interaction.reply({
-        content: removed ? `🗑️ Menu supprimé (store) : \`${messageId}\`` : `⚠️ Aucun menu trouvé : \`${messageId}\``,
-        flags: EPHEMERAL,
-      });
-      return;
-    }
-
-    // create -> wizard
-    const draft = defaultDraft(interaction.guildId, interaction.user.id);
-    setPending(interaction.guildId, interaction.user.id, draft);
-
-    const payload = buildWizardPayload(draft, "Wizard prêt. Configure puis **Publier**.");
-    await interaction.reply({ ...payload, flags: EPHEMERAL });
-  } catch (e) {
-    console.error("[autorole] execute error:", e);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: "❌ Erreur interne /autorole.", flags: EPHEMERAL }).catch(() => {});
-    }
+    const fs = require('fs');
+    if (!fs.existsSync(filepath)) return fallback;
+    const raw = fs.readFileSync(filepath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
   }
 }
 
-module.exports = {
-  data: new SlashCommandBuilder()
-    .setName("autorole")
-    .setDescription("Créer un menu d’auto-rôles (Wizard premium)")
-    .addSubcommand((s) => s.setName("create").setDescription("Ouvrir le wizard (menus + modals)"))
-    .addSubcommand((s) => s.setName("list").setDescription("Lister les menus autorole actifs (store)"))
-    .addSubcommand((s) =>
-      s
-        .setName("delete")
-        .setDescription("Supprimer un menu autorole (store) via messageId")
-        .addStringOption((o) => o.setName("message_id").setDescription("ID du message").setRequired(true))
-    )
-    .setDMPermission(false),
+const data = new SlashCommandBuilder()
+  .setName('autorole')
+  .setDescription('Autoroles: panneau de sélection')
+  .addSubcommand((s) =>
+    s.setName('panel').setDescription('Publie le panneau autoroles dans ce salon')
+  );
 
-  // ✅ IMPORTANT: pas de "this.execute" (sinon crash car fn() perd le this)
-  run: executeAutorole,
-  execute: executeAutorole,
-};
+async function execute(interaction) {
+  const sub = interaction.options.getSubcommand();
+  if (sub !== 'panel') return interaction.reply({ content: 'Sous-commande inconnue.', ephemeral: true });
+
+  // Store format (expected): { roles: [{ roleId, label, description }], title, description }
+  const path = require('path');
+  const storePath = path.join(__dirname, '..', 'autorole', 'autoroleStore.json');
+  const store = safeReadJSON(storePath, {});
+  const roles = Array.isArray(store.roles) ? store.roles : [];
+
+  if (!roles.length) {
+    const e = new EmbedBuilder()
+      .setTitle('🧩 Autoroles')
+      .setDescription(
+        'Aucun autorole configuré pour le moment.\n' +
+          'Le staff doit d\'abord remplir `part2/autorole/autoroleStore.json`.'
+      );
+    await interaction.reply({ embeds: [e], ephemeral: true });
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(store.title || '🧩 Autoroles')
+    .setDescription(store.description || 'Choisis tes rôles ci-dessous :');
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('P2_AUTOROLE:SELECT')
+    .setPlaceholder('Sélectionne un rôle…')
+    .setMinValues(0)
+    .setMaxValues(Math.min(roles.length, 25))
+    .addOptions(
+      roles.slice(0, 25).map((r) => ({
+        label: String(r.label || r.roleId || 'Rôle').slice(0, 100),
+        value: String(r.roleId || ''),
+        description: r.description ? String(r.description).slice(0, 100) : undefined,
+      }))
+    );
+
+  const row = new ActionRowBuilder().addComponents(menu);
+
+  await interaction.reply({ content: '✅ Panneau publié.', ephemeral: true });
+  await interaction.channel.send({ embeds: [embed], components: [row] });
+}
+
+module.exports = { data, execute };

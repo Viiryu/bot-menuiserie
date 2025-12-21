@@ -1,74 +1,49 @@
-// part2/util/modlog.js
-// Helper pour envoyer des logs premium (embeds) dans un salon configuré.
+/**
+ * part2/util/modlog.js
+ * Embeds simples pour logs modération.
+ */
 
 const { EmbedBuilder } = require("discord.js");
-const { getConfig } = require("../config/configState");
 
-function pickColor(action) {
-  const a = String(action || "").toLowerCase();
-  if (["ban", "kick"].includes(a)) return 0xE74C3C;
-  if (["warn", "timeout"].includes(a)) return 0xF1C40F;
-  if (["unban", "untimeout", "unwarn"].includes(a)) return 0x2ECC71;
-  if (["purge", "lock", "unlock", "slowmode"].includes(a)) return 0x3498DB;
-  return 0x95A5A6;
-}
-
-function safeUserTag(u) {
-  if (!u) return "—";
-  return u.tag || `${u.username || "user"}#${u.discriminator || "0000"}`;
-}
-
-function buildLogEmbed({
-  action,
-  actor,
-  target,
-  channel,
-  reason,
-  fields = [],
-  footer,
-}) {
-  const e = new EmbedBuilder()
-    .setTitle(`🧾 Log — ${action}`)
-    .setColor(pickColor(action))
-    .setTimestamp(new Date());
-
-  e.addFields(
-    { name: "👤 Staff", value: actor ? `<@${actor.id}> (${safeUserTag(actor)})` : "—", inline: true },
-    { name: "🎯 Cible", value: target ? `<@${target.id}> (${safeUserTag(target)})` : "—", inline: true },
-    { name: "📍 Salon", value: channel?.id ? `<#${channel.id}>` : "—", inline: true },
-  );
-
-  if (reason) e.addFields({ name: "📝 Raison", value: String(reason).slice(0, 1024), inline: false });
-
-  for (const f of (fields || [])) {
-    if (!f?.name || f?.value == null) continue;
-    e.addFields({ name: String(f.name).slice(0, 256), value: String(f.value).slice(0, 1024), inline: !!f.inline });
-  }
-
-  e.setFooter({ text: footer || "LGW — Le Secrétaire" });
+function buildModLogEmbed({ title, actor, target, reason, extra }) {
+  const e = new EmbedBuilder().setTitle(title).setTimestamp(new Date());
+  if (actor) e.addFields({ name: "Staff", value: actor.toString(), inline: true });
+  if (target) e.addFields({ name: "Cible", value: target.toString(), inline: true });
+  if (reason) e.addFields({ name: "Raison", value: String(reason).slice(0, 1024) });
+  if (extra) e.addFields({ name: "Détails", value: String(extra).slice(0, 1024) });
   return e;
 }
 
-async function sendToChannel(guild, channelId, payload) {
-  if (!guild || !channelId) return false;
-  const ch = await guild.channels.fetch(channelId).catch(() => null);
-  if (!ch || !ch.isTextBased?.()) return false;
-  await ch.send(payload).catch(() => null);
-  return true;
+function buildWarnDM({ guildName, reason }) {
+  return new EmbedBuilder()
+    .setTitle(`Avertissement - ${guildName}`)
+    .setDescription(reason ? String(reason) : "Vous avez reçu un avertissement.")
+    .setTimestamp(new Date());
 }
 
-async function logAction(interaction, logEmbed) {
-  const guild = interaction.guild;
-  if (!guild) return;
-
-  const modlogId = getConfig(guild.id, "modLogChannelId", null);
-  const logsId = getConfig(guild.id, "logChannelId", null);
-
-  const payload = { embeds: [logEmbed] };
-
-  // Priorité: modlog -> logs
-  if (await sendToChannel(guild, modlogId, payload)) return;
-  await sendToChannel(guild, logsId, payload);
+function buildTimeoutDM({ guildName, durationText, reason }) {
+  const desc = [`Durée: ${durationText}`];
+  if (reason) desc.push(`Raison: ${reason}`);
+  return new EmbedBuilder()
+    .setTitle(`Timeout - ${guildName}`)
+    .setDescription(desc.join("\n"))
+    .setTimestamp(new Date());
 }
 
-module.exports = { buildLogEmbed, logAction };
+function buildPurgeLogEmbed({ actor, channel, amount }) {
+  return new EmbedBuilder()
+    .setTitle("Purge")
+    .addFields(
+      { name: "Staff", value: actor?.toString?.() ?? "?", inline: true },
+      { name: "Salon", value: channel?.toString?.() ?? "?", inline: true },
+      { name: "Messages", value: String(amount ?? "?"), inline: true }
+    )
+    .setTimestamp(new Date());
+}
+
+module.exports = {
+  buildModLogEmbed,
+  buildWarnDM,
+  buildTimeoutDM,
+  buildPurgeLogEmbed,
+};

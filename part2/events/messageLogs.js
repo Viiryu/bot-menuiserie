@@ -1,87 +1,114 @@
-const { EmbedBuilder } = require("discord.js");
-const { getConfig } = require("../configStore");
-const { DEFAULT_LOGS_CHANNEL_NAME } = require("../constants");
-const { cut } = require("../util");
-const { cacheMessage, getCached } = require("../messageCache");
+/**
+ * part2/events/messageLogs.js (NO-DB)
+ *
+ * Logs premium (message delete/edit) vers le salon défini dans la config part2.
+ */
 
-// Trouve le salon logs (config DB sinon fallback #logs)
-async function resolveLogsChannel(guild) {
-  const cfg = await getConfig();
-  if (cfg.logsChannelId) return guild.channels.cache.get(cfg.logsChannelId) ?? null;
-  return guild.channels.cache.find((c) => c.name === DEFAULT_LOGS_CHANNEL_NAME) ?? null;
+const { EmbedBuilder } = require("discord.js");
+const { getGuildConfig } = require("../config/configStore");
+
+function clamp(s, n) {
+  const str = String(s ?? "");
+  return str.length > n ? str.slice(0, n - 1) + "…" : str;
+}
+
+async function resolveLogChannel(client, guildId) {
+  try {
+    const cfg = getGuildConfig(guildId);
+    const channelId = cfg?.logsChannelId;
+    if (!channelId) return null;
+    const ch = await client.channels.fetch(channelId).catch(() => null);
+    if (!ch || !ch.isTextBased?.()) return null;
+    return ch;
+  } catch {
+    return null;
+  }
+}
+
+function baseEmbed(title, color) {
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color)
+    .setTimestamp(new Date());
+}
+
+function msgMeta(msg) {
+  return {
+    guildId: msg.guildId || "—",
+    channelId: msg.channelId || "—",
+    messageId: msg.id || "—",
+    authorTag: msg.author?.tag || "—",
+    authorId: msg.author?.id || "—",
+  };
+}
+
+function fmtJump(msg) {
+  try {
+    return msg.url ? `[Aller au message](${msg.url})` : "";
+  } catch {
+    return "";
+  }
 }
 
 function registerMessageLogs(client) {
-  // On remplit le cache
-  client.on("messageCreate", (msg) => cacheMessage(msg));
-
-  // Message modifié
-  client.on("messageUpdate", async (oldMsg, newMsg) => {
-    try {
-      if (!newMsg.guild) return;
-      if (newMsg.author?.bot) return;
-
-      cacheMessage(newMsg);
-
-      const before = oldMsg?.content ?? getCached(newMsg.id)?.content ?? "";
-      const after = newMsg?.content ?? "";
-      if (before === after) return;
-
-      const logCh = await resolveLogsChannel(newMsg.guild);
-      if (!logCh) return;
-
-      const embed = new EmbedBuilder()
-        .setTitle("✏️ Message modifié")
-        .addFields(
-          { name: "Auteur", value: `<@${newMsg.author.id}> (\`${newMsg.author.tag}\`)`, inline: true },
-          { name: "Salon", value: `<#${newMsg.channelId}>`, inline: true },
-          { name: "Avant", value: before ? cut(before) : "_(vide)_" },
-          { name: "Après", value: after ? cut(after) : "_(vide)_" }
-        )
-        .setTimestamp(new Date());
-
-      if (newMsg.url) embed.addFields({ name: "Lien", value: newMsg.url });
-
-      await logCh.send({ embeds: [embed] });
-    } catch (e) {
-      console.error("[part2] messageUpdate log error:", e);
-    }
-  });
-
-  // Message supprimé
   client.on("messageDelete", async (msg) => {
     try {
-      if (!msg.guild) return;
+      if (!msg?.guildId) return;
+      if (msg.author?.bot) return;
 
-      const cached = getCached(msg.id);
-      const authorId = msg.author?.id ?? cached?.authorId;
-      const authorTag = msg.author?.tag ?? cached?.authorTag ?? "Inconnu";
-      if (!authorId) return;
+      const ch = await resolveLogChannel(client, msg.guildId);
+      if (!ch) return;
 
-      const logCh = await resolveLogsChannel(msg.guild);
-      if (!logCh) return;
-
-      const content = msg.content ?? cached?.content ?? "";
-      const attachments = cached?.attachments ?? [];
-
-      const embed = new EmbedBuilder()
-        .setTitle("🗑️ Message supprimé")
-        .addFields(
-          { name: "Auteur", value: `<@${authorId}> (\`${authorTag}\`)`, inline: true },
-          { name: "Salon", value: `<#${msg.channelId}>`, inline: true },
-          { name: "Contenu", value: content ? cut(content) : "_(contenu indisponible)_" }
+      const e = baseEmbed("🗑️ Message supprimé", 0xe74c3c)
+        .setDescription(
+          [
+            `**Salon :** <#${msg.channelId}>`,
+            `**Auteur :** ${msg.author ? `<@${msg.author.id}>` : "—"}`,
+            "",
+            clamp(msg.content || "(pas de contenu)", 3500),
+          ].join("\n")
         )
-        .setTimestamp(new Date());
+        .addFields(
+          {
+            name: "IDs",
+            value: clamp(JSON.stringify(msgMeta(msg), null, 2), 1024),
+            inline: false,
+          }
+        );
 
-      if (attachments.length) {
-        embed.addFields({ name: "Pièces jointes", value: cut(attachments.join("\n")) });
-      }
+      await ch.send({ embeds: [e] }).catch(() => {});
+    } catch {}
+  });
 
-      await logCh.send({ embeds: [embed] });
-    } catch (e) {
-      console.error("[part2] messageDelete log error:", e);
-    }
+  client.on("messageUpdate", async (oldMsg, newMsg) => {
+    try {
+      const msg = newMsg;
+      if (!msg?.guildId) return;
+      if (msg.author?.bot) return;
+
+      const ch = await resolveLogChannel(client, msg.guildId);
+      if (!ch) return;
+
+      const before = clamp(oldMsg?.content || "(vide)", 1500);
+      const after = clamp(newMsg?.content || "(vide)", 1500);
+      if (before === after) return;
+
+      const e = baseEmbed("✏️ Message modifié", 0xf1c40f)
+        .setDescription(
+          [
+            `**Salon :** <#${msg.channelId}>`,
+            `**Auteur :** <@${msg.author.id}>`,
+            fmtJump(msg),
+          ].filter(Boolean).join("\n")
+        )
+        .addFields(
+          { name: "Avant", value: before || "(vide)", inline: false },
+          { name: "Après", value: after || "(vide)", inline: false }
+        );
+
+      await ch.send({ embeds: [e] }).catch(() => {});
+    } catch {}
   });
 }
 
-module.exports = { registerMessageLogs, resolveLogsChannel };
+module.exports = { registerMessageLogs };

@@ -1,4 +1,11 @@
 {
   "version": 1,
-  "guilds": {}
+  "guilds": {
+    "1440657827516645468": {
+      "logsChannelId": null,
+      "modLogsChannelId": null,
+      "announcePingRoleId": null,
+      "maintenance": false
+    }
+  }
 }

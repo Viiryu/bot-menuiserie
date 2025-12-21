@@ -1,19 +1,27 @@
-const { getConfig } = require("./configStore");
+/**
+ * part2/permissions.js
+ *
+ * Règle: staff si Admin OU possède un des rôles staffRoleIds (config part2).
+ */
 
-// Vérifie si un membre a au moins un rôle dans la liste
-function hasAnyRole(member, roleIds) {
-  if (!member?.roles?.cache) return false;
-  return roleIds.some((id) => member.roles.cache.has(id));
+const { getGuildConfig } = require("./config/configStore");
+
+function isStaff(member) {
+  try {
+    if (!member) return false;
+    if (member.permissions?.has?.("Administrator")) return true;
+    if (member.permissions?.has?.("ManageGuild")) return true;
+
+    const cfg = getGuildConfig(member.guild?.id);
+    const staffRoleIds = Array.isArray(cfg?.staffRoleIds) ? cfg.staffRoleIds : [];
+    if (!staffRoleIds.length) return false;
+
+    const roles = member.roles?.cache;
+    if (!roles) return false;
+    return staffRoleIds.some((id) => roles.has(id));
+  } catch {
+    return false;
+  }
 }
 
-async function isStaff(member) {
-  const cfg = await getConfig();
-  return hasAnyRole(member, cfg.staffRoleIds || []);
-}
-
-async function isCompta(member) {
-  const cfg = await getConfig();
-  return hasAnyRole(member, cfg.comptaRoleIds || []);
-}
-
-module.exports = { hasAnyRole, isStaff, isCompta };
+module.exports = { isStaff };
