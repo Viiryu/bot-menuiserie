@@ -1,69 +1,109 @@
+// part2/modals/sayModals.js
+// ✅ Robust handler: always ACK the modal, supports basic text + basic embed publish
+
 const { EmbedBuilder } = require('discord.js');
 const { SAY_IDS } = require('../say/ids');
-const { getPendingSay, clearPendingSay } = require('../say/sayState');
 
-function parseHexColor(input) {
-  if (!input) return null;
-  const cleaned = String(input).trim();
-  const m = cleaned.match(/^#?([0-9a-fA-F]{6})$/);
-  if (!m) return null;
-  return parseInt(m[1], 16);
+function isSayModal(customId) {
+  if (!customId) return false;
+  return (
+    customId === SAY_IDS.MODAL_TEXT ||
+    customId === SAY_IDS.MODAL_EMBED_BASIC ||
+    customId === SAY_IDS.MODAL_EMBED_MEDIA ||
+    customId === SAY_IDS.MODAL_ACTIONS ||
+    (typeof customId === 'string' && customId.startsWith('P2_SAY_') && customId.includes('MODAL'))
+  );
+}
+
+function safeGetField(interaction, key) {
+  try {
+    return interaction.fields.getTextInputValue(key);
+  } catch {
+    return null;
+  }
+}
+
+function parseColor(value) {
+  if (!value) return null;
+  const v = String(value).trim();
+  if (!v) return null;
+  const hex = v.replace('#', '');
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return null;
+  return parseInt(hex, 16);
+}
+
+function pickByHeuristic(fieldsMap, matcher) {
+  for (const [id, val] of Object.entries(fieldsMap)) {
+    if (matcher(id)) return val;
+  }
+  return null;
 }
 
 async function handleSayModals(interaction) {
-  if (!interaction.isModalSubmit()) return false;
-  if (interaction.customId !== SAY_IDS.MODAL_TEXT && interaction.customId !== SAY_IDS.MODAL_EMBED_BASIC) {
-    return false;
-  }
-
-  const pending = getPendingSay(interaction.guildId, interaction.user.id);
-  if (!pending) {
-    await interaction.reply({ content: '❌ Brouillon expiré. Relance `/say`.', ephemeral: true }).catch(() => {});
-    return true;
-  }
-
-  const channelId = pending.channelId;
-  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
-  if (!channel || !('send' in channel)) {
-    clearPendingSay(interaction.guildId, interaction.user.id);
-    await interaction.reply({ content: '❌ Salon introuvable. Relance `/say`.', ephemeral: true }).catch(() => {});
-    return true;
-  }
+  if (!interaction.isModalSubmit?.()) return false;
+  if (!isSayModal(interaction.customId)) return false;
 
   try {
-    if (interaction.customId === SAY_IDS.MODAL_TEXT) {
-      const content = interaction.fields.getTextInputValue('content');
-      await channel.send({ content });
-      clearPendingSay(interaction.guildId, interaction.user.id);
-      await interaction.reply({ content: `✅ Envoyé dans <#${channel.id}>.`, ephemeral: true });
+    // Always ACK quickly to avoid "échec de l'interaction"
+    await interaction.deferReply({ flags: 64 }).catch(() => {});
+
+    const channel = interaction.channel;
+    if (!channel || !channel.send) {
+      await interaction.editReply('❌ Impossible: je ne vois pas le salon où publier.').catch(() => {});
       return true;
     }
 
-    // Embed
-    const title = interaction.fields.getTextInputValue('title')?.trim();
-    const description = interaction.fields.getTextInputValue('description')?.trim();
-    const colorStr = interaction.fields.getTextInputValue('color')?.trim();
-    const footer = interaction.fields.getTextInputValue('footer')?.trim();
-    const image = interaction.fields.getTextInputValue('image')?.trim();
+    // Build a generic map of modal inputs (id -> value)
+    const fieldsMap = {};
+    for (const f of interaction.fields.fields.values()) {
+      fieldsMap[f.customId] = f.value;
+    }
+
+    // TEXT modal
+    if (interaction.customId === SAY_IDS.MODAL_TEXT || interaction.customId.includes('TEXT')) {
+      const content = pickByHeuristic(fieldsMap, (id) => /text|message|content/i.test(id))
+        ?? safeGetField(interaction, 'text')
+        ?? safeGetField(interaction, 'message');
+
+      if (!content || !String(content).trim()) {
+        await interaction.editReply('❌ Texte vide.').catch(() => {});
+        return true;
+      }
+
+      await channel.send({ content: String(content) });
+      await interaction.editReply('✅ Message envoyé.').catch(() => {});
+      return true;
+    }
+
+    // EMBED modal (basic/media)
+    const title = pickByHeuristic(fieldsMap, (id) => /title/i.test(id));
+    const description = pickByHeuristic(fieldsMap, (id) => /desc|description/i.test(id));
+    const footer = pickByHeuristic(fieldsMap, (id) => /footer/i.test(id));
+    const colorRaw = pickByHeuristic(fieldsMap, (id) => /color|couleur/i.test(id));
+    const image = pickByHeuristic(fieldsMap, (id) => /image/i.test(id));
+    const thumbnail = pickByHeuristic(fieldsMap, (id) => /thumb/i.test(id));
 
     const embed = new EmbedBuilder();
-    if (title) embed.setTitle(title);
-    if (description) embed.setDescription(description);
-
-    const color = parseHexColor(colorStr);
+    if (title) embed.setTitle(String(title).slice(0, 256));
+    if (description) embed.setDescription(String(description).slice(0, 4000));
+    const color = parseColor(colorRaw);
     if (color != null) embed.setColor(color);
-
-    if (footer) embed.setFooter({ text: footer });
-    if (image && /^https?:\/\//i.test(image)) embed.setImage(image);
+    if (footer) embed.setFooter({ text: String(footer).slice(0, 2048) });
+    if (thumbnail && /^https?:\/\//i.test(String(thumbnail))) embed.setThumbnail(String(thumbnail));
+    if (image && /^https?:\/\//i.test(String(image))) embed.setImage(String(image));
 
     await channel.send({ embeds: [embed] });
-    clearPendingSay(interaction.guildId, interaction.user.id);
-    await interaction.reply({ content: `✅ Embed envoyé dans <#${channel.id}>.`, ephemeral: true });
+    await interaction.editReply('✅ Embed envoyé.').catch(() => {});
     return true;
-  } catch (err) {
-    console.error('[say] modal submit error:', err);
-    clearPendingSay(interaction.guildId, interaction.user.id);
-    await interaction.reply({ content: '❌ Erreur lors de l’envoi.', ephemeral: true }).catch(() => {});
+  } catch (e) {
+    console.error('[sayModals] error:', e?.stack || e);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('❌ Erreur interne /say (voir console).').catch(() => {});
+      } else {
+        await interaction.reply({ content: '❌ Erreur interne /say (voir console).', flags: 64 }).catch(() => {});
+      }
+    } catch {}
     return true;
   }
 }

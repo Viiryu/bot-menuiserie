@@ -353,6 +353,7 @@ function parseUserId(input) {
 
 // ----- main handler -----
 async function handleStaffInteraction(interaction) {
+  try {
   const guild = interaction.guild;
   if (!guild) return false;
 
@@ -729,6 +730,17 @@ async function handleStaffInteraction(interaction) {
   }
 
   return false;
+  } catch (e) {
+    console.error("[staff] interaction error:", (e && (e.stack || e.message)) || e);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: "❌ Erreur interne (staff). Regarde la console du bot.", flags: 64 }).catch(() => {});
+      } else if (interaction.isRepliable && interaction.isRepliable()) {
+        await interaction.reply({ content: "❌ Erreur interne (staff). Regarde la console du bot.", flags: 64 }).catch(() => {});
+      }
+    } catch {}
+    return true;
+  }
 }
 
 module.exports = { handleStaffInteraction };

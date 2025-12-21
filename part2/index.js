@@ -1,154 +1,156 @@
-// part2/index.js — register + interaction router (commands + buttons + modals)
-"use strict";
+// part2/index.js
+// Router Part2 (staff + say + schedule + autorole + logs)
+// ⚠️ Cette version est "safe": si un module n'existe pas, on ignore sans crash.
 
-const { loadCommands, findCommand } = require("./commands");
+const { startCacheGC } = require("./messageCache");
+const { registerMessageLogs } = require("./events/messageLogs");
+const { findCommand } = require("./commands");
 
-// optional event modules
-function safeRequire(p) {
-  try { return require(p); } catch { return null; }
-}
+// Schedule
+let startScheduler = null;
+let handleScheduleModals = null;
+let handleScheduleUIInteraction = null;
+try {
+  ({ startScheduler } = require("./scheduler/schedulerRunner"));
+  ({ handleScheduleModals } = require("./modals/scheduleModals"));
+  ({ handleScheduleUIInteraction } = require("./scheduler/schedulerUI"));
+} catch {}
 
-function pickFn(mod, names) {
-  for (const n of names) {
-    if (typeof mod?.[n] === "function") return mod[n];
-  }
-  return null;
-}
+// Say
+let handleSayModals = null;
+let handleSayComponents = null;
+let handleSayPresetAutocomplete = null;
+try {
+  ({ handleSayModals } = require("./modals/sayModals"));
+  ({ handleSayComponents } = require("./components/sayComponents"));
+} catch {}
+try {
+  ({ handleSayPresetAutocomplete } = require("./autocomplete/sayPresetAutocomplete"));
+} catch {}
 
-function toEphemeral(interaction) {
-  // discord.js v14 supports { ephemeral: true }.
-  return { ephemeral: true };
-}
+// Autorole
+let loadAutorolesFromDisk = null;
+let handleAutoroleInteraction = null;
+let handleAutoroleComponents = null;
+try {
+  ({ loadAutorolesFromDisk } = require("./autorole/autoroleState"));
+  ({ handleAutoroleInteraction } = require("./autorole/autoroleUI"));
+  ({ handleAutoroleComponents } = require("./autorole/autoroleComponents"));
+} catch {}
 
-function buildErrMsg(e) {
-  const msg = String(e?.message || e || "Erreur inconnue");
-  return msg.length > 1800 ? msg.slice(0, 1800) + "…" : msg;
-}
+// Staff (panel + boutons + modals)
+let handleStaffComponents = null;
+let handleStaffUI = null;
+let handleStaffModals = null;
+let handleStaffModerationModals = null;
 
+try {
+  ({ handleStaffComponents } = require("./staff/staffComponents"));
+} catch {}
+try {
+  ({ handleStaffUI } = require("./staff/staffUI"));
+} catch {}
+try {
+  ({ handleStaffModals } = require("./staff/staffModals"));
+} catch {}
+try {
+  ({ handleStaffModerationModals } = require("./staff/staffModerationModals"));
+} catch {}
+
+/**
+ * Register Part2 services
+ */
 function registerPart2(client) {
-  // Load commands once at boot
-  loadCommands({ silent: false });
+  try {
+    startCacheGC();
+  } catch {}
 
-  // Optional message logs
-  const messageLogs = safeRequire("./events/messageLogs");
-  const registerLogs = pickFn(messageLogs, ["register", "setup", "init"]);
-  if (registerLogs) {
-    try { registerLogs(client); } catch (e) { console.error("[part2] messageLogs register error:", e); }
-  }
+  // Scheduler state
+  try {
+    const { loadSchedulesFromDisk } = require("./scheduler/schedulerState");
+    loadSchedulesFromDisk();
+  } catch {}
 
-  // Optional scheduler runner
-  const schedulerRunner = safeRequire("./scheduler/schedulerRunner");
-  const registerSched = pickFn(schedulerRunner, ["register", "setup", "init", "start"]);
-  if (registerSched) {
-    try { registerSched(client); } catch (e) { console.error("[part2] schedulerRunner register error:", e); }
+  // Autoroles store
+  try {
+    if (typeof loadAutorolesFromDisk === "function") loadAutorolesFromDisk();
+  } catch {}
+
+  // Start scheduler
+  try {
+    if (typeof startScheduler === "function") startScheduler(client);
+  } catch {}
+
+  // Logs message
+  try {
+    registerMessageLogs(client);
+  } catch (e) {
+    console.error("[part2] registerMessageLogs error:", e);
   }
 }
 
-async function handleComponentRouters(interaction) {
-  // Staff router
-  const staffComponents = safeRequire("./staff/staffComponents");
-  const staffHandler = pickFn(staffComponents, [
-    "handleStaffInteraction",
-    "handleInteraction",
-    "handleComponents",
-    "handle",
-  ]);
-  if (staffHandler) {
-    const ok = await staffHandler(interaction).catch(() => false);
-    if (ok) return true;
+/**
+ * Global interaction router for Part2
+ * IMPORTANT: doit être appelé depuis bot.js sur chaque InteractionCreate
+ */
+async function handlePart2Interaction(interaction) {
+  // 0) Autocomplete (si présent)
+  if (interaction.isAutocomplete?.() && typeof handleSayPresetAutocomplete === "function") {
+    if (await handleSayPresetAutocomplete(interaction)) return true;
   }
 
-  // Autorole
-  const autoroleComponents = safeRequire("./autorole/autoroleComponents");
-  const autoroleHandler = pickFn(autoroleComponents, ["handleInteraction", "handleAutoroleInteraction", "handle"]);
-  if (autoroleHandler) {
-    const ok = await autoroleHandler(interaction).catch(() => false);
-    if (ok) return true;
+  // 1) Staff (boutons/selects + modals)
+  if (typeof handleStaffComponents === "function") {
+    if (await handleStaffComponents(interaction)) return true;
+  }
+  if (typeof handleStaffUI === "function") {
+    if (await handleStaffUI(interaction)) return true;
+  }
+  if (typeof handleStaffModerationModals === "function") {
+    if (await handleStaffModerationModals(interaction)) return true;
+  }
+  if (typeof handleStaffModals === "function") {
+    if (await handleStaffModals(interaction)) return true;
   }
 
-  // Schedule modals/UI
-  const scheduleModals = safeRequire("./modals/scheduleModals");
-  const scheduleHandler = pickFn(scheduleModals, ["handleScheduleModals", "handleModals", "handleInteraction", "handle"]);
-  if (scheduleHandler) {
-    const ok = await scheduleHandler(interaction).catch(() => false);
-    if (ok) return true;
+  // 2) Autorole (menus/boutons publics + wizard UI)
+  if (typeof handleAutoroleComponents === "function") {
+    if (await handleAutoroleComponents(interaction)) return true;
   }
-  const schedulerUI = safeRequire("./scheduler/schedulerUI");
-  const schedulerHandler = pickFn(schedulerUI, ["handleSchedulerInteraction", "handleInteraction", "handleUI", "handle"]);
-  if (schedulerHandler) {
-    const ok = await schedulerHandler(interaction).catch(() => false);
-    if (ok) return true;
+  if (typeof handleAutoroleInteraction === "function") {
+    if (await handleAutoroleInteraction(interaction)) return true;
   }
 
-  // Tickets / apps / suggestions modules
-  const tickets = safeRequire("./modules/tickets");
-  const apps = safeRequire("./modules/applications");
-  const sugg = safeRequire("./modules/suggestions");
-  const welcomeLeave = safeRequire("./modules/welcomeLeave");
-  const autoresponses = safeRequire("./modules/autoresponses");
-
-  for (const mod of [tickets, apps, sugg, welcomeLeave, autoresponses]) {
-    const h = pickFn(mod, ["handleInteraction", "handleComponents", "handleModals", "handle"]);
-    if (!h) continue;
-    const ok = await h(interaction).catch(() => false);
-    if (ok) return true;
+  // 3) Say (select/boutons + modals)
+  if (typeof handleSayComponents === "function") {
+    if (await handleSayComponents(interaction)) return true;
+  }
+  if (typeof handleSayModals === "function") {
+    if (await handleSayModals(interaction)) return true;
   }
 
-  // Poll components (if used)
-  const poll = safeRequire("./components/pollComponents");
-  const pollHandler = pickFn(poll, ["handleInteraction", "handle"]);
-  if (pollHandler) {
-    const ok = await pollHandler(interaction).catch(() => false);
-    if (ok) return true;
+  // 4) Schedule (UI + modals)
+  if (typeof handleScheduleUIInteraction === "function") {
+    if (await handleScheduleUIInteraction(interaction)) return true;
+  }
+  if (typeof handleScheduleModals === "function") {
+    if (await handleScheduleModals(interaction)) return true;
+  }
+
+  // 5) Slash commands Part2
+  if (interaction.isChatInputCommand?.() && interaction.isChatInputCommand()) {
+    const cmd = findCommand(interaction.commandName);
+    if (!cmd) return false;
+
+    // compat: certains exportent run, d’autres execute
+    const fn = cmd.run || cmd.execute;
+    if (typeof fn !== "function") return false;
+
+    await fn(interaction);
+    return true;
   }
 
   return false;
-}
-
-async function handlePart2Interaction(interaction) {
-  // COMPONENTS / MODALS
-  if (
-    interaction.isButton?.() ||
-    interaction.isAnySelectMenu?.() ||
-    interaction.isModalSubmit?.()
-  ) {
-    try {
-      const ok = await handleComponentRouters(interaction);
-      return ok;
-    } catch (e) {
-      try {
-        if (!interaction.deferred && !interaction.replied) {
-          await interaction.reply({ content: `❌ ${buildErrMsg(e)}`, ...toEphemeral(interaction) });
-        } else {
-          await interaction.followUp({ content: `❌ ${buildErrMsg(e)}`, ...toEphemeral(interaction) });
-        }
-      } catch {}
-      return true;
-    }
-  }
-
-  // SLASH COMMANDS
-  if (!interaction.isChatInputCommand?.()) return false;
-
-  const name = interaction.commandName;
-  const cmd = findCommand(name);
-
-  if (!cmd) return false;
-
-  try {
-    await cmd.execute(interaction);
-  } catch (e) {
-    console.error("[part2] command execute error:", name, e);
-    try {
-      if (!interaction.deferred && !interaction.replied) {
-        await interaction.reply({ content: `❌ ${buildErrMsg(e)}`, ...toEphemeral(interaction) });
-      } else {
-        await interaction.editReply({ content: `❌ ${buildErrMsg(e)}` });
-      }
-    } catch {}
-  }
-
-  return true;
 }
 
 module.exports = { registerPart2, handlePart2Interaction };

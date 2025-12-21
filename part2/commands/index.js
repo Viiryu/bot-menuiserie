@@ -1,91 +1,45 @@
 // part2/commands/index.js
-// Loader robuste : charge toutes les commandes du dossier.
+// ✅ Export standard attendu : { COMMANDS, findCommand }
+// + Compat: { listCommands, getCommand, loadCommands }
 
-const fs = require('fs');
-const path = require('path');
+const help = require('./help');
+const purge = require('./purge');
+const ban = require('./ban');
+const unban = require('./unban');
+const say = require('./say');
+const schedule = require('./schedule');
+const autorole = require('./autorole');
+const staff = require('./staff');
 
-const COMMANDS = [];
+const RAW = [help, purge, ban, unban, say, schedule, autorole, staff];
 
-function getNameFromData(data) {
-  if (!data) return undefined;
-  if (typeof data.name === 'string' && data.name.trim()) return data.name.trim();
-  try {
-    const json = data.toJSON?.();
-    if (json?.name) return json.name;
-  } catch {}
-  return undefined;
+function getCmdName(c) {
+  return c?.data?.name || c?.name || c?.builder?.name || null;
 }
 
-function isValidCommand(mod) {
-  if (!mod) return false;
-  const data = mod.data;
-  const name = getNameFromData(data);
-  if (!name) return false;
-  const hasExecute = typeof mod.execute === 'function' || typeof mod.run === 'function';
-  return hasExecute;
-}
+const seen = new Set();
+const COMMANDS = RAW.filter((c) => {
+  const n = getCmdName(c);
+  if (!n) return false;
+  if (seen.has(n)) return false;
+  // Empêche les vieux legacy (ex: staffpanel) si jamais un fichier traîne
+  if (n === 'staffpanel') return false;
+  seen.add(n);
+  return true;
+});
 
-function loadCommands() {
-  COMMANDS.length = 0;
-  const dir = __dirname;
-  const files = fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith('.js') && f !== 'index.js')
-    .sort();
-
-  for (const file of files) {
-    const full = path.join(dir, file);
-    // hot-reload safe
-    delete require.cache[require.resolve(full)];
-
-    let mod;
-    try {
-      mod = require(full);
-    } catch (e) {
-      console.error(`[part2/commands] ❌ ${file} require() failed:`, e);
-      continue;
-    }
-
-    const name = getNameFromData(mod?.data);
-    if (!isValidCommand(mod)) {
-      // Logging explicite (comme tu l'aimes) — sans casser le déploiement
-      if (!name) {
-        console.error(`[part2/commands] ❌ ${file} missing data.name (string).`);
-      } else if (!(typeof mod.execute === 'function' || typeof mod.run === 'function')) {
-        console.error(`[part2/commands] ❌ ${file} missing execute(interaction) or run(interaction).`);
-      } else {
-        console.error(`[part2/commands] ❌ ${file} invalid export shape.`);
-      }
-      continue;
-    }
-
-    COMMANDS.push(mod);
-  }
-
-  return COMMANDS;
+function findCommand(name) {
+  return COMMANDS.find((c) => getCmdName(c) === name) || null;
 }
 
 function listCommands() {
-  return COMMANDS.map((c) => `/${getNameFromData(c.data)}`).filter(Boolean);
+  return COMMANDS;
 }
-
 function getCommand(name) {
-  if (!name) return null;
-  const lower = String(name).toLowerCase();
-  return COMMANDS.find((c) => getNameFromData(c.data)?.toLowerCase() === lower) || null;
+  return findCommand(name);
+}
+function loadCommands() {
+  return COMMANDS;
 }
 
-function findCommand(name) {
-  return getCommand(name);
-}
-
-// Auto-load au require
-loadCommands();
-
-module.exports = {
-  COMMANDS,
-  loadCommands,
-  listCommands,
-  getCommand,
-  findCommand,
-};
+module.exports = { COMMANDS, findCommand, listCommands, getCommand, loadCommands };

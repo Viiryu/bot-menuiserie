@@ -1,94 +1,96 @@
 // part2/staff/staffPanel.js
+
 const {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-} = require("discord.js");
-const { STAFF_IDS } = require("./ids");
-const { getGuildConfig } = require("../config/configStore");
+} = require('discord.js');
 
-function iconUrl(client) {
-  try {
-    return client.user?.displayAvatarURL?.() || null;
-  } catch {
-    return null;
-  }
-}
+const { STAFF_IDS } = require('./ids');
 
-function fmtId(id) {
-  return id ? `\`${id}\`` : "—";
+const COLOR = 0x111827;
+
+async function resolveGuild(client, guildOrId) {
+  if (!guildOrId) return null;
+  if (typeof guildOrId === 'object' && guildOrId.id) return guildOrId;
+  const id = String(guildOrId);
+  return (
+    client.guilds.cache.get(id) || (await client.guilds.fetch(id).catch(() => null))
+  );
 }
 
 function buildStaffPanelEmbed(client, guild) {
-  const cfg = getGuildConfig(guild.id);
+  const icon = client.user?.displayAvatarURL?.() || null;
+  const guildName = guild?.name || 'Serveur';
 
-  const e = new EmbedBuilder()
-    .setColor(0x111827)
-    .setTitle("🪵 LGW — Panel Staff (Secrétaire)")
+  return new EmbedBuilder()
+    .setColor(COLOR)
+    .setTitle('🛡️ Panel Staff — Centralisé')
     .setDescription(
       [
-        "Bienvenue dans le **panel centralisé**.",
-        "",
-        "👉 Tout passe par des **boutons / menus** (pas besoin d’écrire 15 commandes).",
-        "",
-        "⚙️ **Config rapide** (IDs actuels) :",
-        `• Logs: ${fmtId(cfg.logChannelId)}`,
-        `• Catégorie tickets: ${fmtId(cfg.ticketCategoryId)}`,
-        `• Logs tickets: ${fmtId(cfg.ticketLogsChannelId)}`,
-        `• Review candidatures: ${fmtId(cfg.applicationReviewChannelId)}`,
-        `• Suggestions: ${fmtId(cfg.suggestionsChannelId)}`,
-        `• Welcome: ${fmtId(cfg.welcomeChannelId)}`,
-        `• Leave: ${fmtId(cfg.leaveChannelId)}`,
-      ].join("\n")
+        `🏷️ **Serveur :** ${guildName}`,
+        '',
+        '👉 Utilise les boutons ci-dessous pour naviguer.',
+        '• **Modération** : warn / timeout / purge',
+        '• **Panels** : tickets / candidatures / suggestions',
+        '• **Auto-réponses** : add / remove / list',
+        '• **Config** : logs / salons / rôles',
+        '• **Outils salon** : lock / slowmode',
+      ].join('\n')
     )
-    .addFields(
-      {
-        name: "🧭 Raccourcis",
-        value: [
-          "• 🛡️ **Modération** : warn / timeout / purge",
-          "• 📌 **Panels Publics** : tickets / candidatures / suggestions",
-          "• 🤖 **Auto-réponses** : add/remove/list",
-          "• 🧰 **Outils salon** : lock/unlock/slowmode",
-        ].join("\n"),
-        inline: false,
-      },
-      {
-        name: "ℹ️ Note",
-        value:
-          "Les actions staff sont **loggées** (si `Logs` est configuré).",
-        inline: false,
-      }
-    )
-    .setTimestamp(new Date());
-
-  const icon = iconUrl(client);
-  if (icon) e.setAuthor({ name: "Le Secrétaire", iconURL: icon }).setThumbnail(icon);
-
-  return e;
+    .setFooter({ text: 'LGW • Secrétaire • Staff' })
+    .setTimestamp(new Date())
+    .setThumbnail(icon);
 }
 
 function buildStaffPanelComponents() {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_MOD).setLabel("Modération").setEmoji("🛡️").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_PANELS).setLabel("Panels publics").setEmoji("📌").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_CONFIG).setLabel("Configuration").setEmoji("⚙️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_MOD)
+      .setLabel('Modération')
+      .setEmoji('🧰')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_PANELS)
+      .setLabel('Panels')
+      .setEmoji('📌')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_AUTORESP)
+      .setLabel('Auto-réponses')
+      .setEmoji('🤖')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_CONFIG)
+      .setLabel('Config')
+      .setEmoji('⚙️')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_CHAN_TOOLS)
+      .setLabel('Salon')
+      .setEmoji('🔧')
+      .setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_AUTORESP).setLabel("Auto-réponses").setEmoji("🤖").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_CHAN_TOOLS).setLabel("Outils salon").setEmoji("🧰").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_HELP).setLabel("Aide").setEmoji("📖").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_HELP)
+      .setLabel('Aide')
+      .setEmoji('📖')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(STAFF_IDS.BTN_CLOSE)
+      .setLabel('Fermer')
+      .setEmoji('🧹')
+      .setStyle(ButtonStyle.Danger)
   );
 
-  const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(STAFF_IDS.BTN_CLOSE).setLabel("Fermer").setEmoji("✖️").setStyle(ButtonStyle.Danger),
-  );
-
-  return [row1, row2, row3];
+  return [row1, row2];
 }
 
-function buildStaffPanelPayload(client, guild) {
+async function buildStaffPanelPayload(client, guildOrId) {
+  const guild = await resolveGuild(client, guildOrId);
   return {
     embeds: [buildStaffPanelEmbed(client, guild)],
     components: buildStaffPanelComponents(),
