@@ -45,7 +45,12 @@ let handleStaffModals = null;
 let handleStaffModerationModals = null;
 
 try {
-  ({ handleStaffComponents } = require("./staff/staffComponents"));
+  const staffComp = require("./staff/staffComponents");
+  handleStaffComponents =
+    staffComp.handleStaffInteraction ||
+    staffComp.handleStaffComponents ||
+    staffComp.handleStaffComponentInteraction ||
+    null;
 } catch {}
 try {
   ({ handleStaffUI } = require("./staff/staffUI"));

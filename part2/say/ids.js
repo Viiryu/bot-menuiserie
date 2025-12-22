@@ -1,11 +1,20 @@
 // part2/say/ids.js
 
-const SAY_IDS = Object.freeze({
+/**
+ * IDs stables du module /say.
+ * ⚠️ Ne change pas ces IDs après déploiement (sinon les boutons/menus déjà postés cassent).
+ */
+
+const SAY_IDS = {
   CMD_SAY: 'say',
+
+  // Modals
   MODAL_TEXT: 'P2_SAY_TEXT_MODAL',
   MODAL_EMBED_BASIC: 'P2_SAY_EMBED_MODAL_BASIC',
   MODAL_EMBED_MEDIA: 'P2_SAY_EMBED_MODAL_MEDIA',
   MODAL_ACTIONS: 'P2_SAY_ACTIONS_MODAL',
+
+  // Buttons (studio)
   BTN_PUBLISH: 'P2_SAY_BTN_PUBLISH',
   BTN_PUBLISH_SILENT: 'P2_SAY_BTN_PUBLISH_SILENT',
   BTN_PUBLISH_MENTION: 'P2_SAY_BTN_PUBLISH_MENTION',
@@ -15,7 +24,16 @@ const SAY_IDS = Object.freeze({
   BTN_EDIT_ACTIONS: 'P2_SAY_BTN_EDIT_ACTIONS',
   BTN_TOGGLE_MENTIONS: 'P2_SAY_BTN_TOGGLE_MENTIONS',
   BTN_CANCEL: 'P2_SAY_BTN_CANCEL',
+
+  // Selects
   SELECT_CHANNEL: 'P2_SAY_SELECT_CHANNEL',
-});
+
+  // Panel (nouveau)
+  PANEL_HOME: 'P2_SAY_PANEL_HOME',
+  BTN_PANEL_TEXT: 'P2_SAY_BTN_PANEL_TEXT',
+  BTN_PANEL_EMBED: 'P2_SAY_BTN_PANEL_EMBED',
+  BTN_PANEL_TEST: 'P2_SAY_BTN_PANEL_TEST',
+  BTN_PANEL_REFRESH: 'P2_SAY_BTN_PANEL_REFRESH',
+};
 
 module.exports = { SAY_IDS };

@@ -1,41 +1,39 @@
 /**
- * tools/clear-global-commands.js
- * Supprime toutes les slash commands GLOBAL (utile si tu as un vieux /staffpanel global qui traîne).
- *
- * Usage:
+ * clear-global-commands.js
+ * 
+ * Supprime TOUTES les slash commands globales (celles qui mettent ~1h à disparaître).
+ * Utile si tu as des doubles commandes (ex: /staffpanel + /staff panel).
+ * 
+ * Pré-requis: .env doit contenir DISCORD_TOKEN et CLIENT_ID (Application ID)
+ * 
+ * Run:
  *   node tools/clear-global-commands.js
- *
- * Variables d'environnement attendues:
- *   DISCORD_TOKEN
- *   DISCORD_CLIENT_ID
  */
-
 require('dotenv').config();
+
 const { REST, Routes } = require('discord.js');
 
 const token = process.env.DISCORD_TOKEN;
-const clientId = process.env.DISCORD_CLIENT_ID;
+const clientId = process.env.CLIENT_ID;
 
-if (!token || !clientId) {
-  console.error('❌ DISCORD_TOKEN ou DISCORD_CLIENT_ID manquant dans .env');
+if (!token) {
+  console.error('❌ DISCORD_TOKEN manquant dans .env');
+  process.exit(1);
+}
+if (!clientId) {
+  console.error('❌ CLIENT_ID manquant dans .env (Application ID du bot)');
+  console.error('➡️ Dev Portal > ton application > General Information > Application ID');
   process.exit(1);
 }
 
 (async () => {
+  const rest = new REST({ version: '10' }).setToken(token);
   try {
-    const rest = new REST({ version: '10' }).setToken(token);
-    const current = await rest.get(Routes.applicationCommands(clientId));
-    const names = Array.isArray(current) ? current.map((c) => `/${c.name}`) : [];
-
-    console.log(`🌍 Global en place (${names.length}) : ${names.length ? names.join(', ') : '—'}`);
-    console.log('🧹 Suppression des GLOBAL...');
-
+    console.log('🧹 Suppression des commandes GLOBAL…');
     await rest.put(Routes.applicationCommands(clientId), { body: [] });
-
-    console.log('✅ Global commands vidées.');
-    console.log('ℹ️ Note: la disparition côté Discord peut prendre un peu de temps (cache client + propagation).');
+    console.log('✅ OK. Les commandes globales vont disparaître (parfois en quelques minutes).');
   } catch (e) {
-    console.error('❌ Clear global failed:', e);
+    console.error('❌ Erreur clear global:', e?.rawError || e?.message || e);
     process.exit(1);
   }
 })();

@@ -2181,18 +2181,83 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 /* ===================== COMMANDES HANDLER ===================== */
 client.on(Events.InteractionCreate, async (interaction) => {
-  // ✅ /say Studio intégré : modals + boutons + select (en premier)
-  try {
-    if (await handleSayModals(interaction)) return;
-    if (await handleSayComponents(interaction)) return;
+// ✅ /say Studio intégré : modals + boutons + select (en premier)
+// + PART2 (schedule/modération/communication/staff/autorole/etc.)
+let __handled = false;
 
-    // PART2: schedule/modération/communication
-    if (await handlePart2Interaction(interaction)) return;
-  } catch (e) {
-    console.error("[part2] handle interaction error:", e);
+try {
+  if (await handleSayModals(interaction)) {
+    __handled = true;
+    return;
+  }
+  if (await handleSayComponents(interaction)) {
+    __handled = true;
+    return;
   }
 
-  if (!interaction.isChatInputCommand()) return;
+  // PART2: schedule/modération/communication (+ staff, autorole, etc.)
+  if (await handlePart2Interaction(interaction)) {
+    __handled = true;
+    return;
+  }
+} catch (e) {
+  console.error("[part2] handle interaction error:", e);
+}
+
+// 🛟 Fallback anti "Échec de l'interaction" + logs (uniquement pour nos customId)
+// Si un bouton/select/modal PART2 n'est pas géré (ou refusé), Discord affiche "Échec de l'interaction".
+// Ici on répond proprement + on log, ce qui permet de patch rapidement.
+if (!interaction.isChatInputCommand()) {
+  const cid = String(interaction.customId || "");
+  const looksOurs =
+    cid.startsWith("LGW_") ||
+    cid.startsWith("LGW-") ||
+    cid.startsWith("LGW:") ||
+    cid.startsWith("LGW_STAFF:") ||
+    cid.startsWith("LGW_TICKETS:") ||
+    cid.startsWith("LGW_APPS:") ||
+    cid.startsWith("LGW_SUGG:") ||
+    cid.startsWith("P2_");
+
+  const isComponent =
+    (typeof interaction.isButton === "function" && interaction.isButton()) ||
+    (typeof interaction.isAnySelectMenu === "function" &&
+      interaction.isAnySelectMenu()) ||
+    (typeof interaction.isModalSubmit === "function" &&
+      interaction.isModalSubmit());
+
+  if (!__handled && looksOurs && isComponent) {
+    const who = `${interaction.user?.tag || "unknown"} (${interaction.user?.id || "?"})`;
+    const where = `guild=${interaction.guildId || "?"} channel=${interaction.channelId || "?"}`;
+    console.warn(`[UNHANDLED_INTERACTION] ${where} user=${who} customId=${cid}`);
+
+    try {
+      await logEvent("warn", "interaction", "unhandled", `customId=${cid}`, {
+        userTag: interaction.user?.tag,
+        userId: interaction.user?.id,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+      });
+    } catch {}
+
+    const msg =
+      "⚠️ Interaction non gérée (ou refusée).\n" +
+      `• customId: \`${cid || "?"}\`\n` +
+      "➡️ Copie-colle cette ligne au dev pour patch.";
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: msg, flags: EPHEMERAL }).catch(() => {});
+      } else {
+        await interaction.reply({ content: msg, flags: EPHEMERAL }).catch(() => {});
+      }
+    } catch {}
+  }
+
+  return;
+}
+
+if (!interaction.isChatInputCommand()) return;
 
   const cmd = interaction.commandName;
 

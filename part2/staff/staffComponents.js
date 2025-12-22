@@ -353,7 +353,6 @@ function parseUserId(input) {
 
 // ----- main handler -----
 async function handleStaffInteraction(interaction) {
-  try {
   const guild = interaction.guild;
   if (!guild) return false;
 
@@ -408,7 +407,8 @@ async function handleStaffInteraction(interaction) {
 
   // Back / Close
   if (isButton && cid === "LGW_STAFF:BACK_MAIN") {
-    return interaction.update(buildStaffPanelPayload(interaction.client, guild));
+    const payload = await Promise.resolve(buildStaffPanelPayload(interaction.client, guild));
+    return interaction.update(payload);
   }
   if (isButton && cid === STAFF_IDS.BTN_CLOSE) {
     return interaction.update({ content: "✅ Fermé.", embeds: [], components: [] });
@@ -730,17 +730,6 @@ async function handleStaffInteraction(interaction) {
   }
 
   return false;
-  } catch (e) {
-    console.error("[staff] interaction error:", (e && (e.stack || e.message)) || e);
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: "❌ Erreur interne (staff). Regarde la console du bot.", flags: 64 }).catch(() => {});
-      } else if (interaction.isRepliable && interaction.isRepliable()) {
-        await interaction.reply({ content: "❌ Erreur interne (staff). Regarde la console du bot.", flags: 64 }).catch(() => {});
-      }
-    } catch {}
-    return true;
-  }
 }
 
-module.exports = { handleStaffInteraction };
+module.exports = { handleStaffInteraction, handleStaffComponents: handleStaffInteraction };

@@ -1,44 +1,58 @@
 // part2/modules/ids.js
-// IDs CustomId (tickets / candidatures / suggestions)
-// ✅ Compat multi-versions : exports alias anciens + nouveaux.
+// IDs utilisés par les modules (tickets, applications, suggestions)
+// ✅ Exporte aussi des alias legacy pour éviter les bugs: TICKET_IDS / APP_IDS / SUGG_IDS
 
-const TICKET_IDS = Object.freeze({
-  // anciens (utilisés dans certains routers)
-  OPEN: 'LGW_TICKETS:OPEN',
-  CLOSE: 'LGW_TICKETS:CLOSE',
-  // nouveaux (lisibles)
+// --- Noms “officiels” ---
+const TICKETS_IDS = {
   PANEL_OPEN: 'LGW_TICKETS:OPEN',
   TICKET_CLOSE: 'LGW_TICKETS:CLOSE',
-});
+};
 
-const APP_IDS = Object.freeze({
-  OPEN: 'LGW_APPS:OPEN',
-  MODAL: 'LGW_APPS:MODAL',
-  APPROVE: 'LGW_APPS:APPROVE:',
-  REJECT: 'LGW_APPS:REJECT:',
-
+const APPLICATION_IDS = {
   PANEL_OPEN: 'LGW_APPS:OPEN',
+  MODAL: 'LGW_APPS:MODAL',
   BTN_APPROVE_PREFIX: 'LGW_APPS:APPROVE:',
   BTN_REJECT_PREFIX: 'LGW_APPS:REJECT:',
-});
+};
 
-const SUGG_IDS = Object.freeze({
-  OPEN: 'LGW_SUGG:OPEN',
-  MODAL: 'LGW_SUGG:MODAL',
+const SUGGEST_IDS = {
   PANEL_OPEN: 'LGW_SUGG:OPEN',
-});
+  MODAL: 'LGW_SUGG:MODAL',
+};
 
-// Legacy plural exports (some files still use them)
-const TICKETS_IDS = TICKET_IDS;
-const APPLICATION_IDS = APP_IDS;
-const SUGGEST_IDS = SUGG_IDS;
+// --- Aliases legacy ---
+// Certains fichiers plus anciens utilisent OPEN/CLOSE + APPROVE/REJECT (sans "_PREFIX").
+const TICKET_IDS = {
+  OPEN: TICKETS_IDS.PANEL_OPEN,
+  CLOSE: TICKETS_IDS.TICKET_CLOSE,
+  PANEL_OPEN: TICKETS_IDS.PANEL_OPEN,
+  TICKET_CLOSE: TICKETS_IDS.TICKET_CLOSE,
+};
+
+const APP_IDS = {
+  OPEN: APPLICATION_IDS.PANEL_OPEN,
+  MODAL: APPLICATION_IDS.MODAL,
+  APPROVE: APPLICATION_IDS.BTN_APPROVE_PREFIX,
+  REJECT: APPLICATION_IDS.BTN_REJECT_PREFIX,
+  PANEL_OPEN: APPLICATION_IDS.PANEL_OPEN,
+  BTN_APPROVE_PREFIX: APPLICATION_IDS.BTN_APPROVE_PREFIX,
+  BTN_REJECT_PREFIX: APPLICATION_IDS.BTN_REJECT_PREFIX,
+};
+
+const SUGG_IDS = {
+  OPEN: SUGGEST_IDS.PANEL_OPEN,
+  MODAL: SUGGEST_IDS.MODAL,
+  PANEL_OPEN: SUGGEST_IDS.PANEL_OPEN,
+};
 
 module.exports = {
-  TICKET_IDS,
-  APP_IDS,
-  SUGG_IDS,
-  // aliases
+  // Noms “officiels”
   TICKETS_IDS,
   APPLICATION_IDS,
   SUGGEST_IDS,
+
+  // Aliases compat
+  TICKET_IDS,
+  APP_IDS,
+  SUGG_IDS,
 };

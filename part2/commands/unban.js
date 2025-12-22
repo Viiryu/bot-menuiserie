@@ -1,32 +1,36 @@
-// part2/commands/unban.js
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
-const { SlashCommandBuilder, PermissionsBitField } = require('discord.js');
+const EPHEMERAL = 64; // InteractionResponseFlags.Ephemeral
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('unban')
-    .setDescription('Débannir un utilisateur (par ID)')
+    .setDescription('Débannir un utilisateur (ID)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
     .addStringOption((o) =>
-      o.setName('user_id').setDescription('ID du user à débannir').setRequired(true)
+      o.setName('user_id').setDescription('ID Discord de la personne à débannir').setRequired(true),
     )
     .addStringOption((o) =>
-      o.setName('raison').setDescription('Raison du débannissement').setRequired(false)
+      o.setName('reason').setDescription('Raison (optionnel)').setRequired(false),
     ),
 
   async execute(interaction) {
-    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.BanMembers)) {
-      return interaction.reply({ content: '❌ Permission manquante: BAN_MEMBERS', flags: 64 }).catch(() => {});
-    }
-
-    const userId = interaction.options.getString('user_id', true).trim();
-    const reason = interaction.options.getString('raison') || 'Unban';
-
     try {
-      await interaction.guild.members.unban(userId, reason);
-      return interaction.reply({ content: `✅ Unban effectué pour **${userId}**.`, flags: 64 }).catch(() => {});
+      const userId = interaction.options.getString('user_id', true).trim();
+      const reason = interaction.options.getString('reason') ?? undefined;
+
+      // basic sanity
+      if (!/^\d{15,22}$/.test(userId)) {
+        return interaction.reply({ content: '❌ ID invalide. Exemple: 123456789012345678', flags: EPHEMERAL });
+      }
+
+      await interaction.guild.bans.remove(userId, reason).catch((e) => {
+        throw e;
+      });
+
+      return interaction.reply({ content: `✅ Débanni : <@${userId}> (${userId})`, flags: EPHEMERAL });
     } catch (e) {
-      console.error('[unban] error:', e);
-      return interaction.reply({ content: `❌ Impossible de débannir **${userId}**. (ID valide ? déjà unban ?)`, flags: 64 }).catch(() => {});
+      return interaction.reply({ content: `❌ Impossible de débannir. Détail: ${e?.message ?? e}`, flags: EPHEMERAL }).catch(() => {});
     }
   },
 };
